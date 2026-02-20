@@ -48,6 +48,18 @@
       "title": "Mole Analyze",
       "description": "Disk explorer — browse folders by size",
       "mode": "view"
+    },
+    {
+      "name": "purge",
+      "title": "Mole Purge",
+      "description": "Clean project build artifacts (node_modules, target, dist)",
+      "mode": "view"
+    },
+    {
+      "name": "installer",
+      "title": "Mole Installer",
+      "description": "Find and remove installer files (.dmg, .pkg)",
+      "mode": "view"
     }
   ],
   "dependencies": {

@@ -1,6 +1,6 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
 import { useEffect, useState, useRef, useCallback } from "react";
-import { execMo, spawnMoStreaming, stripAnsi, confirmAndExecute, trashPaths, execCommand } from "./utils";
+import { execMo, spawnMoStreaming, stripAnsi, confirmAndExecute, trashPaths, execCommand, formatBytesShort } from "./utils";
 import { existsSync } from "fs";
 
 // --- Types ---
@@ -374,12 +374,7 @@ function parseSizeToBytes(sizeStr: string): number {
     return value * (multipliers[unit] || 1);
 }
 
-function formatBytesShort(bytes: number): string {
-    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-    if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-    if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-    return `${bytes} B`;
-}
+
 
 function getCategoryIcon(name: string): Icon {
     const lower = name.toLowerCase();

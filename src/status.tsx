@@ -1,114 +1,73 @@
-import { Detail, Icon, Color, ActionPanel, Action } from "@raycast/api";
+import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
 import { useEffect, useState } from "react";
-import { getSystemInfo } from "./utils";
+import { execCommand, getMoPath, formatBytesShort } from "./utils";
 
-interface SystemStatus {
-    memoryUsedGB: number;
-    memoryTotalGB: number;
-    memoryPercent: number;
-    diskUsedGB: number;
-    diskTotalGB: number;
-    diskPercent: number;
-    diskFreeGB: number;
-    uptimeDays: number;
+interface HealthData {
+    memory_used_gb: number;
+    memory_total_gb: number;
+    disk_used_gb: number;
+    disk_total_gb: number;
+    disk_used_percent: number;
+    uptime_days: number;
 }
 
 export default function StatusCommand() {
-    const [status, setStatus] = useState<SystemStatus | null>(null);
+    const [data, setData] = useState<HealthData | null>(null);
     const [isLoading, setIsLoading] = useState(true);
 
     useEffect(() => {
-        loadStatus();
+        fetchHealthData();
     }, []);
 
-    async function loadStatus() {
+    async function fetchHealthData() {
         setIsLoading(true);
         try {
-            const info = await getSystemInfo();
-            setStatus(info);
-        } catch {
-            // fallback to empty
+            const moPath = await getMoPath();
+            const moleDir = moPath.replace("/bin/mo", "");
+            const scriptPath = `${moleDir}/lib/check/health_json.sh`;
+
+            const { stdout } = await execCommand("bash", ["-c", `source "${scriptPath}" && generate_health_json`]);
+            const parsed = JSON.parse(stdout);
+            setData(parsed);
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            showToast({ style: Toast.Style.Failure, title: "Failed to fetch status", message });
         } finally {
             setIsLoading(false);
         }
     }
 
-    const markdown = status ? buildStatusMarkdown(status) : "Loading...";
+    const memoryColor = data && (data.memory_used_gb / data.memory_total_gb) > 0.8 ? Color.Red : Color.Green;
+    const diskColor = data && data.disk_used_percent > 85 ? Color.Red : Color.Blue;
 
     return (
-        <Detail
-            isLoading={isLoading}
-            navigationTitle="Mole Status"
-            markdown={markdown}
-            metadata={
-                status ? (
-                    <Detail.Metadata>
-                        <Detail.Metadata.Label title="Memory Used" text={`${status.memoryUsedGB} / ${status.memoryTotalGB} GB`} />
-                        <Detail.Metadata.TagList title="Memory">
-                            <Detail.Metadata.TagList.Item
-                                text={`${status.memoryPercent}%`}
-                                color={getPercentColor(status.memoryPercent)}
-                            />
-                        </Detail.Metadata.TagList>
-                        <Detail.Metadata.Separator />
-                        <Detail.Metadata.Label title="Disk Used" text={`${status.diskUsedGB} / ${status.diskTotalGB} GB`} />
-                        <Detail.Metadata.Label title="Disk Free" text={`${status.diskFreeGB} GB`} />
-                        <Detail.Metadata.TagList title="Disk">
-                            <Detail.Metadata.TagList.Item
-                                text={`${status.diskPercent}%`}
-                                color={getPercentColor(status.diskPercent)}
-                            />
-                        </Detail.Metadata.TagList>
-                        <Detail.Metadata.Separator />
-                        <Detail.Metadata.Label title="Uptime" text={`${status.uptimeDays} days`} />
-                    </Detail.Metadata>
-                ) : null
-            }
-            actions={
-                <ActionPanel>
-                    <Action title="Refresh" icon={Icon.ArrowClockwise} onAction={loadStatus} />
-                </ActionPanel>
-            }
-        />
+        <List isLoading={isLoading} searchBarPlaceholder="System metrics...">
+            {data ? (
+                <List.Section title="System Resources">
+                    <List.Item
+                        icon={{ source: Icon.MemoryChip, tintColor: memoryColor }}
+                        title="Memory Usage"
+                        subtitle={`${data.memory_used_gb} GB / ${data.memory_total_gb} GB used`}
+                        accessories={[{ text: `${((data.memory_used_gb / data.memory_total_gb) * 100).toFixed(1)}%` }]}
+                        actions={<ActionPanel><Action title="Refresh" icon={Icon.ArrowClockwise} onAction={fetchHealthData} /></ActionPanel>}
+                    />
+                    <List.Item
+                        icon={{ source: Icon.HardDrive, tintColor: diskColor }}
+                        title="Disk Usage"
+                        subtitle={`${data.disk_used_gb} GB / ${data.disk_total_gb} GB used`}
+                        accessories={[{ text: `${data.disk_used_percent}%` }]}
+                        actions={<ActionPanel><Action title="Refresh" icon={Icon.ArrowClockwise} onAction={fetchHealthData} /></ActionPanel>}
+                    />
+                    <List.Item
+                        icon={{ source: Icon.Clock, tintColor: Color.Orange }}
+                        title="System Uptime"
+                        subtitle={data.uptime_days === 0 ? "Just restarted" : `${data.uptime_days} days`}
+                        actions={<ActionPanel><Action title="Refresh" icon={Icon.ArrowClockwise} onAction={fetchHealthData} /></ActionPanel>}
+                    />
+                </List.Section>
+            ) : (
+                !isLoading && <List.EmptyView icon={Icon.Warning} title="Failed to load status" />
+            )}
+        </List>
     );
-}
-
-function buildStatusMarkdown(s: SystemStatus): string {
-    const memBar = buildProgressBar(s.memoryPercent);
-    const diskBar = buildProgressBar(s.diskPercent);
-
-    return `# 🐹 Mole System Status
-
-## ⚙️ Memory
-\`\`\`
-${memBar}  ${s.memoryPercent}%
-Used: ${s.memoryUsedGB} GB / ${s.memoryTotalGB} GB
-\`\`\`
-
-## 💾 Disk
-\`\`\`
-${diskBar}  ${s.diskPercent}%
-Used: ${s.diskUsedGB} GB / ${s.diskTotalGB} GB
-Free: ${s.diskFreeGB} GB
-\`\`\`
-
-## ⏱️ Uptime
-\`\`\`
-${s.uptimeDays} days
-\`\`\`
-`;
-}
-
-function buildProgressBar(percent: number): string {
-    const totalBlocks = 20;
-    const filled = Math.round((percent / 100) * totalBlocks);
-    const empty = totalBlocks - filled;
-    return "█".repeat(filled) + "░".repeat(empty);
-}
-
-function getPercentColor(percent: number): Color {
-    if (percent >= 90) return Color.Red;
-    if (percent >= 70) return Color.Orange;
-    if (percent >= 50) return Color.Yellow;
-    return Color.Green;
 }
