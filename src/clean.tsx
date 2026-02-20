@@ -1,6 +1,7 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
 import { useEffect, useState } from "react";
-import { execMo, stripAnsi, confirmAndExecute } from "./utils";
+import { execMo, stripAnsi, confirmAndExecute, trashPaths } from "./utils";
+import { existsSync } from "fs";
 
 // --- Types ---
 
@@ -132,9 +133,16 @@ export default function CleanCommand() {
                                     actions={
                                         <ActionPanel>
                                             <Action
-                                                title="執行全部清理"
+                                                title={`清理 ${category.name}`}
                                                 icon={Icon.Trash}
                                                 style={Action.Style.Destructive}
+                                                onAction={() => cleanCategory(category, runDryRun)}
+                                            />
+                                            <Action
+                                                title="清理全部"
+                                                icon={Icon.ExclamationMark}
+                                                style={Action.Style.Destructive}
+                                                shortcut={{ modifiers: ["cmd", "shift"], key: "delete" }}
                                                 onAction={executeClean}
                                             />
                                             <Action title="重新掃描" icon={Icon.ArrowClockwise} onAction={runDryRun} />
@@ -161,6 +169,61 @@ export default function CleanCommand() {
             )}
         </List>
     );
+}
+// --- Per-Category Clean ---
+
+const CLEAN_LIST_PATH = `${process.env.HOME}/.config/mole/clean-list.txt`;
+
+async function cleanCategory(category: CleanCategory, refresh: () => Promise<void>) {
+    // Read Mole's clean-list.txt to find actual paths for this category
+    const paths = await getPathsForCategory(category.name);
+    const sizeDisplay = category.totalSize || "selected items";
+
+    await confirmAndExecute({
+        title: `清理 ${category.name}？`,
+        message: `將清理 ${sizeDisplay}。此操作無法復原。`,
+        primaryAction: `清理 ${category.name}`,
+        onConfirm: async () => {
+            if (paths.length > 0) {
+                await trashPaths(paths);
+            }
+            await showToast({ style: Toast.Style.Success, title: `已清理 ${category.name}` });
+            await refresh();
+        },
+    });
+}
+
+async function getPathsForCategory(categoryName: string): Promise<string[]> {
+    try {
+        const { readFileSync } = await import("fs");
+        const content = readFileSync(CLEAN_LIST_PATH, "utf-8");
+        const paths: string[] = [];
+        let inCategory = false;
+
+        for (const line of content.split("\n")) {
+            const trimmed = line.trim();
+
+            // Category header: === Category Name ===
+            if (trimmed.startsWith("===") && trimmed.endsWith("===")) {
+                const name = trimmed.replace(/^=+\s*/, "").replace(/\s*=+$/, "").trim();
+                inCategory = name.toLowerCase() === categoryName.toLowerCase();
+                continue;
+            }
+
+            if (!inCategory) continue;
+            if (!trimmed || trimmed.startsWith("#")) continue;
+
+            // Extract path (before optional # comment)
+            const pathPart = trimmed.split("#")[0].trim();
+            if (pathPart && pathPart.startsWith("/") && existsSync(pathPart)) {
+                paths.push(pathPart);
+            }
+        }
+
+        return paths;
+    } catch {
+        return [];
+    }
 }
 
 // --- Parser ---
