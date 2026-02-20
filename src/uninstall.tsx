@@ -20,26 +20,24 @@ export default function UninstallCommand() {
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
-    async function fetchApps() {
-      setIsLoading(true);
-      try {
-        const foundApps = await scanApps();
-        setApps(foundApps);
-
-        // Asynchronously fetch sizes in background so UI doesn't block parsing bundles for 100+ apps
-        calculateSizes(foundApps);
-      } catch (err) {
-        showToast({ style: Toast.Style.Failure, title: "Failed to scan apps", message: String(err) });
-      } finally {
-        setIsLoading(false);
-      }
+  async function fetchApps() {
+    setIsLoading(true);
+    try {
+      const foundApps = await scanApps();
+      setApps(foundApps);
+      calculateSizes(foundApps);
+    } catch (err) {
+      showToast({ style: Toast.Style.Failure, title: "Failed to scan apps", message: String(err) });
+    } finally {
+      setIsLoading(false);
     }
+  }
+
+  useEffect(() => {
     fetchApps();
   }, []);
 
   async function calculateSizes(initialApps: InstalledApp[]) {
-    // We update state individually or in batches
     for (const app of initialApps) {
       execAsync(`du -sk "${app.path}"`)
         .then(({ stdout }) => {
@@ -64,9 +62,6 @@ export default function UninstallCommand() {
       onConfirm: async () => {
         await showToast({ style: Toast.Style.Animated, title: `Uninstalling ${app.name}...` });
         try {
-          // If we have bundle ID or exact name, we can ask Mole to uninstall it properly or do it via native trash + leftovers
-          // mole uninstall <bundle_id> or <name> natively supports silent mode if we script it, but mole uninstall expects interactive input usually.
-          // Fallback: Custom leftover remover since Mole CLI is interactive
           const pathsToTrash = [app.path];
 
           if (app.bundleId) {
@@ -86,8 +81,10 @@ export default function UninstallCommand() {
           }
 
           await trashPaths(pathsToTrash);
-          setApps((prev) => prev.filter((p) => p.path !== app.path));
           await showToast({ style: Toast.Style.Success, title: `${app.name} uninstalled` });
+
+          // Refresh the list from the filesystem instead of just filtering state
+          await fetchApps();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           await showToast({ style: Toast.Style.Failure, title: "Failed to uninstall", message });
@@ -232,7 +229,7 @@ async function scanApps(): Promise<InstalledApp[]> {
           });
         }
       }
-    } catch {}
+    } catch { }
   }
 
   return apps;
