@@ -1,6 +1,6 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
-import { useEffect, useState } from "react";
-import { execMo, stripAnsi, confirmAndExecute, trashPaths } from "./utils";
+import { useEffect, useState, useRef, useCallback } from "react";
+import { execMo, spawnMoStreaming, stripAnsi, confirmAndExecute, trashPaths } from "./utils";
 import { existsSync } from "fs";
 
 // --- Types ---
@@ -29,30 +29,121 @@ export default function CleanCommand() {
     const [summary, setSummary] = useState<CleanSummary | null>(null);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [scanStatus, setScanStatus] = useState("");
 
-    useEffect(() => {
-        runDryRun();
-    }, []);
+    // Use refs to accumulate state during streaming
+    const categoriesRef = useRef<CleanCategory[]>([]);
+    const currentCategoryRef = useRef<CleanCategory | null>(null);
+    const currentScanIdRef = useRef(0);
 
-    async function runDryRun() {
+    const runDryRun = useCallback(async () => {
+        const scanId = ++currentScanIdRef.current;
+
         setIsLoading(true);
         setError(null);
+        setCategories([]);
+        setSummary(null);
+        setScanStatus("正在掃描...");
+        categoriesRef.current = [];
+        currentCategoryRef.current = null;
+
         try {
-            const output = await execMo(["clean", "--dry-run"]);
-            const { categories: parsed, summary: parsedSummary } = parseMoCleanOutput(output);
-            setCategories(parsed);
-            setSummary(parsedSummary);
+            await spawnMoStreaming(["clean", "--dry-run"], (line) => {
+                if (currentScanIdRef.current !== scanId) return; // Prevent concurrent streams making duplicates
+
+                const stripped = stripAnsi(line).trim();
+                if (!stripped) return;
+
+                // Summary line
+                const summaryMatch = stripped.match(
+                    /Potential space:\s*([\d.]+\s*\w+)\s*\|\s*Items:\s*(\d+)\s*\|\s*Categories:\s*(\d+)/,
+                );
+                if (summaryMatch) {
+                    setSummary({
+                        totalSize: summaryMatch[1],
+                        totalItems: summaryMatch[2],
+                        totalCategories: summaryMatch[3],
+                    });
+                    return;
+                }
+
+                // Section header: ➤ Category name
+                if (stripped.startsWith("➤")) {
+                    // Push previous category
+                    if (currentCategoryRef.current) {
+                        finalizeCategorySize(currentCategoryRef.current);
+                        categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
+                        setCategories([...categoriesRef.current]);
+                    }
+                    const name = stripped.replace(/^➤\s*/, "").trim();
+                    currentCategoryRef.current = { name, items: [], totalSize: "" };
+                    setScanStatus(`正在掃描 ${name}...`);
+                    return;
+                }
+
+                if (!currentCategoryRef.current) return;
+
+                // Item: → description, SIZE dry
+                const dryMatch = stripped.match(/^→\s*(.+?),\s*([\d.]+\s*\w+)\s*dry$/);
+                if (dryMatch) {
+                    currentCategoryRef.current.items.push({ description: dryMatch[1], size: dryMatch[2] });
+                    finalizeCategorySize(currentCategoryRef.current);
+                    // Update immediately so user sees the item appear
+                    setCategories([...categoriesRef.current, currentCategoryRef.current]);
+                    return;
+                }
+
+                // Item: → description · would clean/empty
+                const wouldMatch = stripped.match(/^→\s*(.+?)\s*·\s*would\s+(.+)/);
+                if (wouldMatch) {
+                    currentCategoryRef.current.items.push({
+                        description: `${wouldMatch[1]} (would ${wouldMatch[2]})`,
+                        size: "",
+                    });
+                    setCategories([...categoriesRef.current, currentCategoryRef.current]);
+                    return;
+                }
+
+                // Item: → description (no size, not a path)
+                const simpleMatch = stripped.match(/^→\s*(.+)/);
+                if (simpleMatch && !simpleMatch[1].startsWith("/")) {
+                    currentCategoryRef.current.items.push({ description: simpleMatch[1], size: "" });
+                    setCategories([...categoriesRef.current, currentCategoryRef.current]);
+                    return;
+                }
+
+                // Scanning progress: • description
+                if (stripped.startsWith("•")) {
+                    setScanStatus(stripped.replace(/^•\s*/, ""));
+                }
+            });
+
+            if (currentScanIdRef.current !== scanId) return;
+
+            // Push final category
+            if (currentCategoryRef.current) {
+                finalizeCategorySize(currentCategoryRef.current);
+                categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
+                setCategories([...categoriesRef.current]);
+            }
         } catch (err) {
+            if (currentScanIdRef.current !== scanId) return;
             const message = err instanceof Error ? err.message : String(err);
             setError(message);
             await showToast({ style: Toast.Style.Failure, title: "掃描失敗", message });
         } finally {
-            setIsLoading(false);
+            if (currentScanIdRef.current === scanId) {
+                setIsLoading(false);
+                setScanStatus("");
+            }
         }
-    }
+    }, []);
+
+    useEffect(() => {
+        runDryRun();
+    }, [runDryRun]);
 
     async function executeClean() {
-        // Compute total from parsed categories as fallback
         const computedTotal = categories
             .flatMap((c) => c.items)
             .map((i) => parseSizeToBytes(i.size))
@@ -68,7 +159,7 @@ export default function CleanCommand() {
                 await showToast({
                     style: Toast.Style.Success,
                     title: "清理完成！",
-                    message: `已釋放 ${summary?.totalSize || ""}`,
+                    message: `已釋放 ${totalDisplay}`,
                 });
                 await runDryRun();
             },
@@ -101,6 +192,18 @@ export default function CleanCommand() {
                 <List.EmptyView icon={Icon.Checkmark} title="系統已經很乾淨！" description="沒有可清理的項目" />
             ) : (
                 <>
+                    {/* Loading status */}
+                    {isLoading && scanStatus && (
+                        <List.Section title="Scanning">
+                            <List.Item
+                                icon={{ source: Icon.MagnifyingGlass, tintColor: Color.Blue }}
+                                title={scanStatus}
+                                accessories={[{ tag: { value: "掃描中", color: Color.Blue } }]}
+                            />
+                        </List.Section>
+                    )}
+
+                    {/* Summary */}
                     {summary && (
                         <List.Section title="Summary">
                             <List.Item
@@ -122,6 +225,7 @@ export default function CleanCommand() {
                         </List.Section>
                     )}
 
+                    {/* Categories with items */}
                     {nonEmptyCategories.map((category) => (
                         <List.Section key={category.name} title={category.name} subtitle={category.totalSize}>
                             {category.items.map((item, idx) => (
@@ -153,7 +257,8 @@ export default function CleanCommand() {
                         </List.Section>
                     ))}
 
-                    {emptyCategories.length > 0 && (
+                    {/* Clean categories */}
+                    {!isLoading && emptyCategories.length > 0 && (
                         <List.Section title="Already Clean">
                             {emptyCategories.map((category) => (
                                 <List.Item
@@ -170,12 +275,12 @@ export default function CleanCommand() {
         </List>
     );
 }
+
 // --- Per-Category Clean ---
 
 const CLEAN_LIST_PATH = `${process.env.HOME}/.config/mole/clean-list.txt`;
 
 async function cleanCategory(category: CleanCategory, refresh: () => Promise<void>) {
-    // Read Mole's clean-list.txt to find actual paths for this category
     const paths = await getPathsForCategory(category.name);
     const sizeDisplay = category.totalSize || "selected items";
 
@@ -203,7 +308,6 @@ async function getPathsForCategory(categoryName: string): Promise<string[]> {
         for (const line of content.split("\n")) {
             const trimmed = line.trim();
 
-            // Category header: === Category Name ===
             if (trimmed.startsWith("===") && trimmed.endsWith("===")) {
                 const name = trimmed.replace(/^=+\s*/, "").replace(/\s*=+$/, "").trim();
                 inCategory = name.toLowerCase() === categoryName.toLowerCase();
@@ -213,7 +317,6 @@ async function getPathsForCategory(categoryName: string): Promise<string[]> {
             if (!inCategory) continue;
             if (!trimmed || trimmed.startsWith("#")) continue;
 
-            // Extract path (before optional # comment)
             const pathPart = trimmed.split("#")[0].trim();
             if (pathPart && pathPart.startsWith("/") && existsSync(pathPart)) {
                 paths.push(pathPart);
@@ -226,88 +329,13 @@ async function getPathsForCategory(categoryName: string): Promise<string[]> {
     }
 }
 
-// --- Parser ---
-// Actual mo clean --dry-run output format:
-//   ➤ Category name
-//     → Item description, 5.50GB dry
-//     → Item · would clean
-//     ✓ Nothing to clean
-//   ...
-//   Potential space: 10.83GB | Items: 941 | Categories: 27
+// --- Helpers ---
 
-function parseMoCleanOutput(output: string): {
-    categories: CleanCategory[];
-    summary: CleanSummary | null;
-} {
-    const categories: CleanCategory[] = [];
-    let currentCategory: CleanCategory | null = null;
-    let summary: CleanSummary | null = null;
-
-    for (const line of output.split("\n")) {
-        const stripped = stripAnsi(line).trim();
-        if (!stripped) continue;
-
-        // Summary line: "Potential space: 10.83GB | Items: 941 | Categories: 27"
-        const summaryMatch = stripped.match(/Potential space:\s*([\d.]+\s*\w+)\s*\|\s*Items:\s*(\d+)\s*\|\s*Categories:\s*(\d+)/);
-        if (summaryMatch) {
-            summary = {
-                totalSize: summaryMatch[1],
-                totalItems: summaryMatch[2],
-                totalCategories: summaryMatch[3],
-            };
-            continue;
-        }
-
-        // Section header: ➤ Category name
-        if (stripped.startsWith("➤")) {
-            if (currentCategory) categories.push(currentCategory);
-            currentCategory = {
-                name: stripped.replace(/^➤\s*/, "").trim(),
-                items: [],
-                totalSize: "",
-            };
-            continue;
-        }
-
-        if (!currentCategory) continue;
-
-        // Item: → description, SIZE dry
-        const dryMatch = stripped.match(/^→\s*(.+?),\s*([\d.]+\s*\w+)\s*dry$/);
-        if (dryMatch) {
-            currentCategory.items.push({ description: dryMatch[1], size: dryMatch[2] });
-            continue;
-        }
-
-        // Item: → description · would clean/empty
-        const wouldMatch = stripped.match(/^→\s*(.+?)\s*·\s*would\s+(.+)/);
-        if (wouldMatch) {
-            currentCategory.items.push({ description: `${wouldMatch[1]} (would ${wouldMatch[2]})`, size: "" });
-            continue;
-        }
-
-        // Item: → description (no size)
-        const simpleMatch = stripped.match(/^→\s*(.+)/);
-        if (simpleMatch && !simpleMatch[1].startsWith("/")) {
-            currentCategory.items.push({ description: simpleMatch[1], size: "" });
-            continue;
-        }
-
-        // Nothing to clean — mark category as clean (keep it, no items)
-        // ✓ Nothing to clean — handled by empty items array
+function finalizeCategorySize(category: CleanCategory) {
+    const sizes = category.items.map((i) => parseSizeToBytes(i.size)).filter((s) => s > 0);
+    if (sizes.length > 0) {
+        category.totalSize = formatBytesShort(sizes.reduce((a, b) => a + b, 0));
     }
-
-    if (currentCategory) categories.push(currentCategory);
-
-    // Calculate total size per category
-    for (const cat of categories) {
-        const sizes = cat.items.map((i) => parseSizeToBytes(i.size)).filter((s) => s > 0);
-        if (sizes.length > 0) {
-            const total = sizes.reduce((a, b) => a + b, 0);
-            cat.totalSize = formatBytesShort(total);
-        }
-    }
-
-    return { categories, summary };
 }
 
 function parseSizeToBytes(sizeStr: string): number {
@@ -352,7 +380,7 @@ function getCategoryIcon(name: string): Icon {
 
 function getSizeColor(size: string): Color {
     const bytes = parseSizeToBytes(size);
-    const gb = bytes / (1024 ** 3);
+    const gb = bytes / 1024 ** 3;
     if (gb >= 2) return Color.Red;
     if (gb >= 0.5) return Color.Orange;
     if (gb >= 0.1) return Color.Yellow;

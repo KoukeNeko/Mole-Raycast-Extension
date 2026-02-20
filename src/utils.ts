@@ -92,6 +92,64 @@ export async function execMo(args: string[]): Promise<string> {
     }
 }
 
+/**
+ * Stream mo command output line-by-line for real-time progress.
+ * Calls onLine for each new line, and resolves when process exits.
+ */
+export function spawnMoStreaming(
+    args: string[],
+    onLine: (line: string) => void,
+): Promise<void> {
+    const { spawn } = require("child_process") as typeof import("child_process");
+
+    return new Promise(async (resolve, reject) => {
+        let moPath: string;
+        try {
+            moPath = await getMoPath();
+        } catch (err) {
+            reject(err);
+            return;
+        }
+
+        const shellPath = buildShellPath();
+        const proc = spawn(moPath, args, {
+            env: {
+                ...process.env,
+                PATH: shellPath,
+                TERM: "dumb",
+                NO_COLOR: "1",
+                LC_ALL: "C",
+            },
+            stdio: ["ignore", "pipe", "ignore"], // ignore stdin and stderr
+        });
+
+        let buffer = "";
+        proc.stdout.on("data", (chunk: Buffer) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || ""; // keep incomplete last line
+            for (const line of lines) {
+                onLine(line);
+            }
+        });
+
+        proc.on("close", () => {
+            if (buffer.trim()) onLine(buffer);
+            resolve();
+        });
+
+        proc.on("error", (err: Error) => {
+            reject(new Error(`mo ${args.join(" ")} failed: ${err.message}`));
+        });
+
+        // Timeout: 5 minutes
+        setTimeout(() => {
+            proc.kill();
+            resolve(); // don't reject — partial results are still useful
+        }, 300_000);
+    });
+}
+
 export async function execCommand(command: string, args: string[]): Promise<string> {
     const { stdout } = await execFileAsync(command, args, {
         timeout: 30_000,
