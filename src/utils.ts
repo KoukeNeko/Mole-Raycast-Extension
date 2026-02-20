@@ -1,9 +1,10 @@
-import { execFile } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import { showToast, Toast, confirmAlert, Alert, trash } from "@raycast/api";
 import { existsSync, statSync, readdirSync } from "fs";
 import path from "path";
 
+const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 // --- Constants ---
@@ -46,16 +47,49 @@ export async function getMoPath(): Promise<string> {
     throw new Error("Mole (mo) 未安裝。請先執行 `brew install mole` 或參考 https://github.com/tw93/mole");
 }
 
+function buildShellPath(): string {
+    const paths = [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/opt/homebrew/bin",
+        `${process.env.HOME}/.local/bin`,
+    ];
+    return paths.join(":");
+}
+
 // --- Command Execution ---
 
 export async function execMo(args: string[]): Promise<string> {
     const moPath = await getMoPath();
-    const { stdout } = await execFileAsync(moPath, args, {
-        env: { ...process.env, TERM: "dumb", NO_COLOR: "1", LC_ALL: "C" },
-        timeout: 120_000,
-        maxBuffer: 10 * 1024 * 1024,
-    });
-    return stdout;
+    const shellPath = buildShellPath();
+    const escapedArgs = args.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
+    // Use shell exec with stderr suppressed — Mole scripts emit non-fatal
+    // warnings (e.g. unbound variable) to stderr but produce valid stdout.
+    const command = `"${moPath}" ${escapedArgs} 2>/dev/null`;
+    try {
+        const { stdout } = await execAsync(command, {
+            env: {
+                ...process.env,
+                PATH: shellPath,
+                TERM: "dumb",
+                NO_COLOR: "1",
+                LC_ALL: "C",
+            },
+            timeout: 300_000,
+            maxBuffer: 10 * 1024 * 1024,
+            shell: "/bin/bash",
+        });
+        return stdout;
+    } catch (err: unknown) {
+        // exec throws when exit code != 0; try to extract stdout anyway
+        const error = err as { stdout?: string; stderr?: string; message?: string };
+        if (error.stdout && error.stdout.trim().length > 0) {
+            return error.stdout;
+        }
+        const detail = error.stderr || error.message || String(err);
+        throw new Error(`mo ${args.join(" ")} failed: ${detail}`);
+    }
 }
 
 export async function execCommand(command: string, args: string[]): Promise<string> {
