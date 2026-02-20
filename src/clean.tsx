@@ -290,7 +290,30 @@ async function cleanCategory(category: CleanCategory, refresh: () => Promise<voi
         primaryAction: `清理 ${category.name}`,
         onConfirm: async () => {
             if (paths.length > 0) {
-                await trashPaths(paths);
+                const { readdirSync, statSync } = await import("fs");
+                const pathModule = await import("path");
+                const toTrash: string[] = [];
+
+                for (const p of paths) {
+                    try {
+                        const stat = statSync(p);
+                        if (stat.isDirectory()) {
+                            // Trash the contents, not the directory itself
+                            const items = readdirSync(p);
+                            for (const item of items) {
+                                toTrash.push(pathModule.join(p, item));
+                            }
+                        } else {
+                            toTrash.push(p);
+                        }
+                    } catch {
+                        // skip files we can't access
+                    }
+                }
+
+                if (toTrash.length > 0) {
+                    await trashPaths(toTrash);
+                }
             }
             await showToast({ style: Toast.Style.Success, title: `已清理 ${category.name}` });
             await refresh();
