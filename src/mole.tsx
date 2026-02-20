@@ -1,6 +1,10 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color, launchCommand, LaunchType } from "@raycast/api";
 import { useEffect, useState } from "react";
+import { exec } from "child_process";
+import { promisify } from "util";
 import { execMo } from "./utils";
+
+const execAsync = promisify(exec);
 
 interface VersionInfo {
   version: string;
@@ -38,13 +42,21 @@ export default function Command() {
   }, []);
 
   async function configureTouchID() {
-    await showToast({ style: Toast.Style.Animated, title: "Configuring Touch ID..." });
+    await showToast({ style: Toast.Style.Animated, title: "Opening Terminal for Touch ID setup..." });
     try {
-      await execMo(["touchid"]);
-      await showToast({ style: Toast.Style.Success, title: "Touch ID Configured" });
+      const COMMAND_FILE = "/tmp/mole_touchid.command";
+      const { stdout: moPath } = await execAsync("which mo").catch(() => ({ stdout: "/usr/local/bin/mo" }));
+      const p = moPath.trim() || "/opt/homebrew/bin/mo"; // Fallback if `which` fails
+
+      const scriptContent = `#!/bin/bash
+clear
+"${p}" touchid
+`;
+      await execAsync(`echo '${scriptContent}' > ${COMMAND_FILE} && chmod +x ${COMMAND_FILE} && open ${COMMAND_FILE}`);
+      await showToast({ style: Toast.Style.Success, title: "Terminal Opened" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await showToast({ style: Toast.Style.Failure, title: "Failed", message });
+      await showToast({ style: Toast.Style.Failure, title: "Failed to Launch Terminal", message });
     }
   }
 
