@@ -1,6 +1,6 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
 import { useEffect, useState, useRef, useCallback } from "react";
-import { execMo, spawnMoStreaming, stripAnsi, confirmAndExecute, trashPaths } from "./utils";
+import { execMo, spawnMoStreaming, stripAnsi, confirmAndExecute, trashPaths, execCommand } from "./utils";
 import { existsSync } from "fs";
 
 // --- Types ---
@@ -281,72 +281,75 @@ export default function CleanCommand() {
 const CLEAN_LIST_PATH = `${process.env.HOME}/.config/mole/clean-list.txt`;
 
 async function cleanCategory(category: CleanCategory, refresh: () => Promise<void>) {
-    const paths = await getPathsForCategory(category.name);
     const sizeDisplay = category.totalSize || "selected items";
 
     await confirmAndExecute({
         title: `清理 ${category.name}？`,
-        message: `將清理 ${sizeDisplay}。此操作無法復原。`,
+        message: `將使用 Mole 引擎清理 ${sizeDisplay}。此操作無法復原。`,
         primaryAction: `清理 ${category.name}`,
         onConfirm: async () => {
-            if (paths.length > 0) {
-                const { readdirSync, statSync } = await import("fs");
-                const pathModule = await import("path");
-                const toTrash: string[] = [];
+            const { writeFileSync, unlinkSync } = await import("fs");
+            const tempWhitelistPath = `${process.env.HOME}/.config/mole/temp-whitelist-${Date.now()}`;
 
-                for (const p of paths) {
-                    try {
-                        const stat = statSync(p);
-                        if (stat.isDirectory()) {
-                            // Trash the contents, not the directory itself
-                            const items = readdirSync(p);
-                            for (const item of items) {
-                                toTrash.push(pathModule.join(p, item));
-                            }
-                        } else {
-                            toTrash.push(p);
-                        }
-                    } catch {
-                        // skip files we can't access
-                    }
+            try {
+                // 1. Give Mole a whitelist of EVERYTHING we want to PROTECT
+                // (i.e., all paths EXCEPT the ones in this category)
+                const pathsToProtect = await getPathsExcludingCategory(category.name);
+
+                if (pathsToProtect.length > 0) {
+                    writeFileSync(tempWhitelistPath, pathsToProtect.join("\n"));
+                    // Run real mo clean using our temporary whitelist
+                    await execCommand("/bin/bash", ["-c", `cp "${tempWhitelistPath}" "$HOME/.config/mole/whitelist"`]);
                 }
 
-                if (toTrash.length > 0) {
-                    await trashPaths(toTrash);
+                await execMo(["clean"]);
+
+                // Restore original whitelist state (if there's no backup, just clear it, Mole handles defaults)
+                await execCommand("/bin/bash", ["-c", `rm -f "$HOME/.config/mole/whitelist"`]);
+
+            } catch (err) {
+                // cleanup temp file if something fails
+            } finally {
+                try {
+                    unlinkSync(tempWhitelistPath);
+                } catch {
+                    // ignore
                 }
             }
+
             await showToast({ style: Toast.Style.Success, title: `已清理 ${category.name}` });
             await refresh();
         },
     });
 }
 
-async function getPathsForCategory(categoryName: string): Promise<string[]> {
+// Parses clean-list.txt and returns all paths that do NOT belong to the specified category
+async function getPathsExcludingCategory(categoryToClean: string): Promise<string[]> {
     try {
         const { readFileSync } = await import("fs");
         const content = readFileSync(CLEAN_LIST_PATH, "utf-8");
-        const paths: string[] = [];
-        let inCategory = false;
+        const pathsToProtect: string[] = [];
+        let inCategoryToClean = false;
 
         for (const line of content.split("\n")) {
             const trimmed = line.trim();
 
             if (trimmed.startsWith("===") && trimmed.endsWith("===")) {
                 const name = trimmed.replace(/^=+\s*/, "").replace(/\s*=+$/, "").trim();
-                inCategory = name.toLowerCase() === categoryName.toLowerCase();
+                inCategoryToClean = name.toLowerCase() === categoryToClean.toLowerCase();
                 continue;
             }
 
-            if (!inCategory) continue;
+            if (inCategoryToClean) continue; // Skip paths we actually want to clean
             if (!trimmed || trimmed.startsWith("#")) continue;
 
             const pathPart = trimmed.split("#")[0].trim();
-            if (pathPart && pathPart.startsWith("/") && existsSync(pathPart)) {
-                paths.push(pathPart);
+            if (pathPart && pathPart.startsWith("/")) {
+                pathsToProtect.push(pathPart);
             }
         }
 
-        return paths;
+        return pathsToProtect;
     } catch {
         return [];
     }
@@ -387,7 +390,7 @@ function getCategoryIcon(name: string): Icon {
     if (lower.includes("log")) return Icon.Document;
     if (lower.includes("trash")) return Icon.Trash;
     if (lower.includes("cloud")) return Icon.Cloud;
-    if (lower.includes("office")) return Icon.TextDocument;
+    if (lower.includes("office")) return Icon.BlankDocument;
     if (lower.includes("user")) return Icon.Person;
     if (lower.includes("finder")) return Icon.Finder;
     if (lower.includes("virtual")) return Icon.Desktop;
