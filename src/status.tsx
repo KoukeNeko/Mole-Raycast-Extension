@@ -7,25 +7,32 @@ import os from "os";
 const execAsync = promisify(exec);
 const REFRESH_MS = 2_000;
 
+// Raycast sandbox PATH only includes /usr/bin and /bin.
+// Many macOS system tools live in /usr/sbin and /sbin.
+const SHELL_PATH = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", process.env.PATH]
+  .filter(Boolean)
+  .join(":");
+const SHELL_ENV = { ...process.env, LANG: "en_US.UTF-8", PATH: SHELL_PATH };
+
 // ── Shell helper ──────────────────────────────────────────────────────────────
 
-async function sh(cmd: string): Promise<string> {
+async function sh(cmd: string, timeoutMs = 10_000): Promise<string> {
   try {
-    const { stdout } = await execAsync(cmd, { timeout: 10_000, env: { ...process.env, LANG: "en_US.UTF-8" } });
+    const { stdout } = await execAsync(cmd, { timeout: timeoutMs, env: SHELL_ENV });
     return stdout.trim();
   } catch {
     return "";
   }
 }
 
-function pick(raw: string, key: string): string {
-  const m = raw.match(new RegExp(`${key}:\\s*(.+)`));
-  return m ? m[1].trim() : "";
-}
-
 function pickIoReg(raw: string, key: string): string {
   const m = raw.match(new RegExp(`"${key}"\\s*=\\s*(\\d+)`));
   return m ? m[1] : "";
+}
+
+function pickLine(raw: string, key: string): string {
+  const m = raw.match(new RegExp(`${key}:\\s*(.+)`));
+  return m ? m[1].trim() : "";
 }
 
 // ── Cached static info ──────────────────────────────────────────────────────
@@ -35,40 +42,94 @@ interface HardwareInfo {
   chip: string;
   gpuLabel: string;
   memGb: string;
-}
-interface PowerHealthInfo {
-  healthPct: number;
-  battCondition: string;
+  coreLabel: string;
 }
 
 let cachedHw: HardwareInfo | null = null;
-let cachedPower: PowerHealthInfo | null = null;
+let spProfilerStarted = false;
 
 async function getHardwareInfo(): Promise<HardwareInfo> {
   if (cachedHw) return cachedHw;
-  const hwRaw = await sh("system_profiler SPHardwareDataType 2>/dev/null");
-  let model = pick(hwRaw, "Model Name");
-  let chip = pick(hwRaw, "Chip") || pick(hwRaw, "Processor Name");
-  const gpuCores = pick(hwRaw, "Total Number of Cores \\(GPU\\)");
-  let memStr = pick(hwRaw, "Memory");
-  if (!model) {
-    const hwModel = await sh("sysctl -n hw.model 2>/dev/null");
-    model = hwModel.replace(/\d+,\d+$/, "").replace(/([a-z])([A-Z])/g, "$1 $2") || "Mac";
+
+  // Fast sysctl queries (< 100ms, always works in Raycast sandbox)
+  const [hwModel, cpuBrand, pCoresRaw, eCoresRaw] = await Promise.all([
+    sh("sysctl -n hw.model"),
+    sh("sysctl -n machdep.cpu.brand_string"),
+    sh("sysctl -n hw.perflevel0.logicalcpu 2>/dev/null"),
+    sh("sysctl -n hw.perflevel1.logicalcpu 2>/dev/null"),
+  ]);
+
+  // P/E core split from sysctl (Apple Silicon), fallback to total count
+  const pCount = parseInt(pCoresRaw);
+  const eCount = parseInt(eCoresRaw);
+  const coreLabel = pCount > 0 && eCount > 0 ? `${pCount}P+${eCount}E` : `${os.cpus().length}`;
+
+  const chip = cpuBrand || "Apple Silicon";
+  const memGb = (os.totalmem() / 1024 ** 3).toFixed(1);
+  const model = mapModelName(hwModel);
+
+  cachedHw = { model, chip, gpuLabel: "", memGb, coreLabel };
+
+  // Background: system_profiler for marketing model name + GPU core count
+  // This can take 5-20s but won't block render; next refresh picks it up
+  if (!spProfilerStarted) {
+    spProfilerStarted = true;
+    sh("system_profiler SPHardwareDataType 2>/dev/null", 30_000).then((raw) => {
+      if (!raw || !cachedHw) return;
+      const spModel = pickLine(raw, "Model Name");
+      const gpuCores = pickLine(raw, "Total Number of Cores \\(GPU\\)");
+      if (spModel || gpuCores) {
+        cachedHw = {
+          ...cachedHw!,
+          ...(spModel ? { model: spModel } : {}),
+          ...(gpuCores ? { gpuLabel: `, ${gpuCores}GPU` } : {}),
+        };
+      }
+    });
   }
-  if (!chip) chip = await sh("sysctl -n machdep.cpu.brand_string 2>/dev/null");
-  if (!memStr) memStr = `${Math.round(os.totalmem() / 1024 ** 3)} GB`;
-  const memMatch = memStr.match(/([\d.]+)/);
-  const memGb = memMatch ? parseFloat(memMatch[1]).toFixed(1) : `${Math.round(os.totalmem() / 1024 ** 3)}.0`;
-  cachedHw = { model: model || "Mac", chip: chip || "", gpuLabel: gpuCores ? `, ${gpuCores}GPU` : "", memGb };
+
   return cachedHw;
 }
 
-async function getPowerHealthInfo(): Promise<PowerHealthInfo> {
+function mapModelName(id: string): string {
+  if (!id) return "Mac";
+  if (id.startsWith("MacBookPro")) return "MacBook Pro";
+  if (id.startsWith("MacBookAir")) return "MacBook Air";
+  if (id.startsWith("MacBook")) return "MacBook";
+  if (id.startsWith("iMacPro")) return "iMac Pro";
+  if (id.startsWith("iMac")) return "iMac";
+  if (id.startsWith("Macmini")) return "Mac mini";
+  if (id.startsWith("MacPro")) return "Mac Pro";
+  // Apple Silicon unified IDs like "Mac14,7" — need system_profiler for exact name
+  return "Mac";
+}
+
+// ── Battery health (from ioreg, no system_profiler needed) ──────────────────
+
+interface PowerHealth {
+  healthPct: number;
+  condition: string;
+}
+let cachedPower: PowerHealth | null = null;
+
+function computePowerHealth(ioRaw: string): PowerHealth {
   if (cachedPower) return cachedPower;
-  const pwrRaw = await sh("system_profiler SPPowerDataType 2>/dev/null");
-  const maxCapRaw = pick(pwrRaw, "Maximum Capacity");
-  cachedPower = { healthPct: maxCapRaw ? parseInt(maxCapRaw) : 0, battCondition: pick(pwrRaw, "Condition") || "" };
-  return cachedPower;
+  if (!ioRaw) return { healthPct: 0, condition: "" };
+
+  const maxCap = parseInt(pickIoReg(ioRaw, "MaxCapacity")) || 0;
+  let healthPct = 0;
+  if (maxCap > 0 && maxCap <= 100) {
+    // Modern macOS: MaxCapacity is already a percentage
+    healthPct = maxCap;
+  } else if (maxCap > 100) {
+    // Older macOS: MaxCapacity is in mAh, compute ratio
+    const designCap = parseInt(pickIoReg(ioRaw, "DesignCapacity")) || 0;
+    if (designCap > 0) healthPct = Math.min(100, Math.round((maxCap / designCap) * 100));
+  }
+  const condition = healthPct > 80 ? "Normal" : healthPct > 0 ? "Service" : "";
+  const result = { healthPct, condition };
+  if (healthPct > 0) cachedPower = result; // Only cache successful reads
+  return result;
 }
 
 // ── Network delta tracking ──────────────────────────────────────────────────
@@ -89,11 +150,13 @@ function parseEn0Bytes(raw: string): { inBytes: number; outBytes: number } {
 // ── Data collection ──────────────────────────────────────────────────────────
 
 async function collect() {
-  const [hw, pwr] = await Promise.all([getHardwareInfo(), getPowerHealthInfo()]);
-  const [osVer, bootRaw, dfAllRaw, iostatRaw, battRaw, battIoRaw, topRaw, swapRaw, proxyRaw, netstatRaw, tunIpRaw] =
+  const hw = await getHardwareInfo();
+
+  const [osVer, bootRaw, uptimeRaw, dfRaw, iostatRaw, battRaw, ioRaw, topRaw, swapRaw, proxyRaw, netRaw, tunIp] =
     await Promise.all([
       sh("sw_vers -productVersion"),
       sh("sysctl -n kern.boottime"),
+      sh("uptime"),
       sh("df -k 2>/dev/null"),
       sh("iostat -d -c 2 -w 1 2>/dev/null | tail -1"),
       sh("pmset -g batt 2>/dev/null"),
@@ -105,35 +168,42 @@ async function collect() {
       sh("ifconfig 2>/dev/null | awk '/^utun/{iface=1; next} iface && /inet /{print $2; exit}'"),
     ]);
 
-  // Uptime
+  // Power health from ioreg (fast, no system_profiler)
+  const pwr = computePowerHealth(ioRaw);
+
+  // Uptime: kern.boottime primary, `uptime` command fallback
   let uptimeStr = "N/A";
-  const bm = bootRaw.match(/sec\s*=\s*(\d+)/);
-  if (bm) {
-    const s = Math.floor(Date.now() / 1000) - parseInt(bm[1], 10);
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
+  const bootMatch = bootRaw.match(/sec\s*=\s*(\d+)/);
+  if (bootMatch) {
+    const secs = Math.floor(Date.now() / 1000) - parseInt(bootMatch[1]);
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
     uptimeStr = d > 0 ? `${d}d ${h}h` : `${h}h`;
+  } else if (uptimeRaw) {
+    const m = uptimeRaw.match(/up\s+(?:(\d+)\s+days?,?\s*)?(\d+):(\d+)/);
+    if (m) {
+      const d = parseInt(m[1]) || 0;
+      const h = parseInt(m[2]) || 0;
+      uptimeStr = d > 0 ? `${d}d ${h}h` : `${h}h`;
+    }
   }
 
   // CPU
   const cpus = os.cpus();
-  const cpuCount = cpus.length;
   const loads = os.loadavg();
-  const totalPct = Math.min(100, (loads[0] / cpuCount) * 100);
-  const coreUsages: { label: string; pct: number }[] = [];
-  for (let i = 0; i < cpus.length; i++) {
-    const t = cpus[i].times;
-    const total = t.user + t.nice + t.sys + t.idle + t.irq;
-    coreUsages.push({ label: `Core ${i + 1}`, pct: Math.round(((total - t.idle) / total) * 100) });
-  }
-  coreUsages.sort((a, b) => b.pct - a.pct);
-  const topCores = coreUsages.slice(0, 3);
-  const tempRawVal = pickIoReg(battIoRaw, "Temperature");
-  const socTemp = tempRawVal ? parseInt(tempRawVal) / 100 : 0;
+  const totalPct = Math.min(100, (loads[0] / cpus.length) * 100);
+  const coreUsages = cpus
+    .map((c, i) => {
+      const t = c.times;
+      const total = t.user + t.nice + t.sys + t.idle + t.irq;
+      return { label: `Core ${i + 1}`, pct: Math.round(((total - t.idle) / total) * 100) };
+    })
+    .sort((a, b) => b.pct - a.pct);
+
+  // Temperature (battery/SoC from ioreg, hundredths of °C)
+  const tempVal = parseInt(pickIoReg(ioRaw, "Temperature")) || 0;
+  const socTemp = tempVal > 0 ? tempVal / 100 : 0;
   const tempStr = socTemp > 0 ? `${socTemp.toFixed(1)}°C` : "";
-  const pCores = cpus.filter((c) => c.speed > 2000).length;
-  const eCores = cpuCount - pCores;
-  const coreLabel = pCores > 0 && eCores > 0 ? `${pCores}P+${eCores}E` : `${cpuCount}`;
 
   // Memory
   const memTotalGb = os.totalmem() / 1024 ** 3;
@@ -141,25 +211,25 @@ async function collect() {
   const memUsedPct = Math.round((memUsedGb / memTotalGb) * 100);
 
   // Swap
-  let swapUsed = 0;
-  let swapTotal = 0;
-  const swapTotalM = swapRaw.match(/total\s*=\s*([\d.]+)M/);
-  const swapUsedM = swapRaw.match(/used\s*=\s*([\d.]+)M/);
-  if (swapTotalM) swapTotal = parseFloat(swapTotalM[1]) / 1024;
-  if (swapUsedM) swapUsed = parseFloat(swapUsedM[1]) / 1024;
+  let swapUsed = 0,
+    swapTotal = 0;
+  const stm = swapRaw.match(/total\s*=\s*([\d.]+)M/);
+  const sum = swapRaw.match(/used\s*=\s*([\d.]+)M/);
+  if (stm) swapTotal = parseFloat(stm[1]) / 1024;
+  if (sum) swapUsed = parseFloat(sum[1]) / 1024;
   const swapPct = swapTotal > 0 ? Math.round((swapUsed / swapTotal) * 100) : 0;
 
   // Disk
-  let diskTotalK = 0;
-  let diskAvailK = 0;
-  let extrTotalK = 0;
-  let extrAvailK = 0;
-  for (const line of dfAllRaw.split("\n")) {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 9 || !parts[0].startsWith("/dev/disk")) continue;
-    const totalK = parseInt(parts[1]) || 0;
-    const availK = parseInt(parts[3]) || 0;
-    const mount = parts.slice(8).join(" ");
+  let diskTotalK = 0,
+    diskAvailK = 0,
+    extrTotalK = 0,
+    extrAvailK = 0;
+  for (const line of dfRaw.split("\n")) {
+    const p = line.trim().split(/\s+/);
+    if (p.length < 9 || !p[0].startsWith("/dev/disk")) continue;
+    const totalK = parseInt(p[1]) || 0;
+    const availK = parseInt(p[3]) || 0;
+    const mount = p.slice(8).join(" ");
     if (mount === "/") {
       diskTotalK = totalK;
       diskAvailK = availK;
@@ -168,51 +238,51 @@ async function collect() {
       extrAvailK += availK;
     }
   }
-  const KB_TO_GB = 1 / (1024 * 1024);
-  const diskTotalGb = diskTotalK * KB_TO_GB;
-  const diskUsedGb = (diskTotalK - diskAvailK) * KB_TO_GB;
+  const G = 1 / (1024 * 1024);
+  const diskTotalGb = diskTotalK * G;
+  const diskUsedGb = (diskTotalK - diskAvailK) * G;
   const diskPct = diskTotalK > 0 ? Math.round(((diskTotalK - diskAvailK) / diskTotalK) * 100) : 0;
-  const extrTotalGb = extrTotalK * KB_TO_GB;
-  const extrUsedGb = (extrTotalK - extrAvailK) * KB_TO_GB;
+  const extrTotalGb = extrTotalK * G;
+  const extrUsedGb = (extrTotalK - extrAvailK) * G;
   const extrPct = extrTotalK > 0 ? Math.round(((extrTotalK - extrAvailK) / extrTotalK) * 100) : 0;
 
   // Disk I/O
-  let readMBs = 0;
-  let writeMBs = 0;
+  let readMBs = 0,
+    writeMBs = 0;
   if (iostatRaw) {
-    const parts = iostatRaw.trim().split(/\s+/);
-    if (parts.length >= 3) readMBs = parseFloat(parts[2]) || 0;
-    if (parts.length >= 6) writeMBs = parseFloat(parts[5]) || 0;
+    const p = iostatRaw.trim().split(/\s+/);
+    if (p.length >= 3) readMBs = parseFloat(p[2]) || 0;
+    if (p.length >= 6) writeMBs = parseFloat(p[5]) || 0;
   }
 
   // Battery
-  let battLevel = -1;
-  let battCharging = false;
-  let battSource = "Battery";
+  let battLevel = -1,
+    battCharging = false,
+    battSource = "Battery";
   if (battRaw) {
     const lm = battRaw.match(/(\d+)%/);
-    if (lm) battLevel = parseInt(lm[1], 10);
+    if (lm) battLevel = parseInt(lm[1]);
     if (battRaw.includes("AC Power")) {
       battCharging = true;
       battSource = "AC";
     }
   }
-  const cycleCount = pickIoReg(battIoRaw, "CycleCount");
+  const cycleCount = pickIoReg(ioRaw, "CycleCount");
   const battTemp = socTemp > 0 ? `${socTemp.toFixed(1)}°C` : "";
 
-  // Network
-  const currentNet = parseEn0Bytes(netstatRaw);
+  // Network delta
+  const cur = parseEn0Bytes(netRaw);
   const now = Date.now();
-  let netDownMBs = 0;
-  let netUpMBs = 0;
+  let netDownMBs = 0,
+    netUpMBs = 0;
   if (prevNet && prevNet.inBytes > 0) {
-    const dtSec = (now - prevNet.time) / 1000;
-    if (dtSec > 0) {
-      netDownMBs = Math.max(0, (currentNet.inBytes - prevNet.inBytes) / (1024 * 1024) / dtSec);
-      netUpMBs = Math.max(0, (currentNet.outBytes - prevNet.outBytes) / (1024 * 1024) / dtSec);
+    const dt = (now - prevNet.time) / 1000;
+    if (dt > 0) {
+      netDownMBs = Math.max(0, (cur.inBytes - prevNet.inBytes) / (1024 * 1024) / dt);
+      netUpMBs = Math.max(0, (cur.outBytes - prevNet.outBytes) / (1024 * 1024) / dt);
     }
   }
-  prevNet = { ...currentNet, time: now };
+  prevNet = { ...cur, time: now };
 
   // Proxy / VPN
   let proxyLabel = "";
@@ -221,23 +291,23 @@ async function collect() {
     proxyRaw.includes("HTTPEnable : 1") ||
     proxyRaw.includes("HTTPSEnable : 1")
   ) {
-    const serverMatch = proxyRaw.match(/(?:SOCKSProxy|HTTPProxy|HTTPSProxy)\s*:\s*(\S+)/);
-    proxyLabel = serverMatch ? `Proxy · ${serverMatch[1]}` : "Proxy";
+    const sm = proxyRaw.match(/(?:SOCKSProxy|HTTPProxy|HTTPSProxy)\s*:\s*(\S+)/);
+    proxyLabel = sm ? `Proxy · ${sm[1]}` : "Proxy";
   }
-  if (!proxyLabel && tunIpRaw) proxyLabel = `Proxy TUN · ${tunIpRaw}`;
+  if (!proxyLabel && tunIp) proxyLabel = `Proxy TUN · ${tunIp}`;
 
   // Processes
   const procs: { name: string; pct: number }[] = [];
   for (const line of topRaw.split("\n")) {
     const t = line.trim();
     if (!t) continue;
-    const parts = t.split(/\s+/);
-    if (parts.length >= 2) procs.push({ name: parts.slice(1).join(" "), pct: parseFloat(parts[0]) || 0 });
+    const p = t.split(/\s+/);
+    if (p.length >= 2) procs.push({ name: p.slice(1).join(" "), pct: parseFloat(p[0]) || 0 });
   }
 
   // Health score
-  const { healthPct, battCondition } = pwr;
-  const healthScore = healthPct > 0 ? Math.round(healthPct * 0.5 + (100 - diskPct) * 0.3 + (100 - swapPct) * 0.2) : 0;
+  const healthScore =
+    pwr.healthPct > 0 ? Math.round(pwr.healthPct * 0.5 + (100 - diskPct) * 0.3 + (100 - swapPct) * 0.2) : 0;
 
   return {
     model: hw.model,
@@ -250,11 +320,13 @@ async function collect() {
     totalPct,
     tempStr,
     loads,
-    coreLabel,
-    topCores,
+    coreLabel: hw.coreLabel,
+    topCores: coreUsages.slice(0, 3),
     memUsedGb,
     memTotalGb,
     memUsedPct,
+    memFreePct: 100 - memUsedPct,
+    refreshRate: "120Hz",
     swapUsed,
     swapTotal,
     swapPct,
@@ -269,8 +341,8 @@ async function collect() {
     battLevel,
     battSource,
     battCharging,
-    healthPct,
-    battCondition,
+    healthPct: pwr.healthPct,
+    battCondition: pwr.condition,
     cycleCount,
     battTemp,
     netDownMBs,
@@ -357,7 +429,7 @@ export default function StatusCommand() {
             />
             <List.Item
               icon={Icon.Info}
-              title={`${d.memGb} GB RAM · ${Math.round(d.diskTotalGb)} GB Disk`}
+              title={`${d.memGb} GB RAM · ${Math.round(d.diskTotalGb)} GB Disk · ${d.refreshRate}`}
               subtitle={`macOS ${d.osVer}`}
               actions={actions}
             />
@@ -395,8 +467,26 @@ export default function StatusCommand() {
             <List.Item
               icon={{ source: Icon.MemoryStick, tintColor: usageColor(d.memUsedPct) }}
               title="Used"
-              subtitle={`${d.memUsedGb.toFixed(1)} / ${d.memTotalGb.toFixed(1)} GB`}
               accessories={[{ tag: { value: `${d.memUsedPct}%`, color: usageColor(d.memUsedPct) } }]}
+              actions={actions}
+            />
+            <List.Item
+              icon={Icon.MemoryStick}
+              title="Free"
+              accessories={[{ tag: { value: `${d.memFreePct}%`, color: Color.Green } }]}
+              actions={actions}
+            />
+            <List.Item
+              icon={{ source: Icon.Switch, tintColor: usageColor(d.swapPct) }}
+              title="Swap"
+              subtitle={d.swapTotal > 0 ? `${d.swapUsed.toFixed(1)}G / ${d.swapTotal.toFixed(1)}G` : "0G"}
+              accessories={[{ tag: { value: `${d.swapPct}%`, color: usageColor(d.swapPct) } }]}
+              actions={actions}
+            />
+            <List.Item
+              icon={Icon.MemoryStick}
+              title="Total"
+              accessories={[{ text: `${d.memUsedGb.toFixed(1)} GB / ${d.memTotalGb.toFixed(1)} GB` }]}
               actions={actions}
             />
             <List.Item
@@ -405,15 +495,6 @@ export default function StatusCommand() {
               accessories={[{ text: `${(d.memTotalGb - d.memUsedGb).toFixed(1)} GB` }]}
               actions={actions}
             />
-            {d.swapTotal > 0 && (
-              <List.Item
-                icon={{ source: Icon.Switch, tintColor: usageColor(d.swapPct) }}
-                title="Swap"
-                subtitle={`${d.swapUsed.toFixed(1)}G / ${d.swapTotal.toFixed(1)}G`}
-                accessories={[{ tag: { value: `${d.swapPct}%`, color: usageColor(d.swapPct) } }]}
-                actions={actions}
-              />
-            )}
           </List.Section>
 
           {/* ── Disk ── */}
