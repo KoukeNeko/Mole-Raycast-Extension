@@ -81,7 +81,7 @@ clear
           actions={<CommandAction name="clean" />}
         />
         <List.Item
-          icon={{ source: Icon.Wrench, tintColor: Color.Blue }}
+          icon={{ source: Icon.WrenchScrewdriver, tintColor: Color.Blue }}
           title="Optimize"
           subtitle="Check and maintain system"
           actions={<CommandAction name="optimize" />}
@@ -122,6 +122,12 @@ clear
       </List.Section>
 
       <List.Section title="Settings & Tools">
+        <List.Item
+          icon={{ source: Icon.Gear, tintColor: Color.PrimaryText }}
+          title="Mole Settings"
+          subtitle="Manage whitelists and custom purge paths"
+          actions={<CommandAction name="settings" />}
+        />
         <List.Item
           icon={{ source: Icon.Fingerprint, tintColor: Color.SecondaryText }}
           title="Configure Touch ID"

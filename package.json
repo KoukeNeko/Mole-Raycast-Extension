@@ -60,6 +60,12 @@
       "title": "Mole Installer",
       "description": "Find and remove installer files (.dmg, .pkg)",
       "mode": "view"
+    },
+    {
+      "name": "settings",
+      "title": "Mole Settings",
+      "description": "Manage whitelists, purge paths, and configurations",
+      "mode": "view"
     }
   ],
   "dependencies": {
