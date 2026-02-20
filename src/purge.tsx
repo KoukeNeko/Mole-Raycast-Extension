@@ -170,46 +170,77 @@ export default function PurgeCommand() {
 
 // --- Scanner Helpers ---
 
+async function findPurgeTargetsNative(dir: string, currentDepth: number, maxDepth: number, targets: Set<string>, results: PurgeItem[]) {
+  if (currentDepth > maxDepth) return;
+  try {
+    const ents = fs.readdirSync(dir, { withFileTypes: true });
+    for (const ent of ents) {
+      if (!ent.isDirectory()) continue;
+
+      const name = ent.name;
+      // Skip hidden directories like .git or protected paths except those we are looking for like .next
+      if ((name.startsWith(".") && !targets.has(name)) || name === "Library" || name === "System") {
+        continue;
+      }
+
+      const fullPath = path.join(dir, name);
+
+      if (targets.has(name)) {
+        // We found a target, add it and DO NOT descend further (e.g., skip nested node_modules)
+        results.push({
+          name: name,
+          path: fullPath,
+          project: path.basename(dir), // Parent directory is the project name
+          isLoadingSize: true,
+        });
+      } else {
+        // Not a target, keep digging
+        await findPurgeTargetsNative(fullPath, currentDepth + 1, maxDepth, targets, results);
+      }
+    }
+  } catch {
+    // ignore access errors
+  }
+}
+
 async function discoverPurgeTargets(): Promise<PurgeItem[]> {
   const home = process.env.HOME || "";
-  const searchPaths = ["www", "dev", "Projects", "GitHub", "Code", "Workspace", "Repos", "Development"]
+  const searchDirs = ["www", "dev", "Projects", "GitHub", "Code", "Workspace", "Repos", "Development", ""];
+
+  const searchPaths = searchDirs
     .map((d) => path.join(home, d))
     .filter((p) => fs.existsSync(p));
 
+  // Add the custom mole config path if it exists
+  const molePathsConfig = path.join(home, ".config/mole/purge_paths");
+  if (fs.existsSync(molePathsConfig)) {
+    try {
+      const customPaths = fs.readFileSync(molePathsConfig, "utf8")
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l && !l.startsWith("#"));
+      for (let p of customPaths) {
+        if (p.startsWith("~/")) p = path.join(home, p.slice(2));
+        if (fs.existsSync(p) && !searchPaths.includes(p)) {
+          searchPaths.push(p);
+        }
+      }
+    } catch { }
+  }
+
   if (searchPaths.length === 0) return [];
 
-  const targets = ["node_modules", "target", "build", "dist", "vendor", "DerivedData", ".next", ".nuxt"];
-  const filterQuery = targets.map((t) => `kMDItemFSName == "${t}"`).join(" || ");
-  const scopeArgs = searchPaths.map((p) => `-onlyin "${p}"`).join(" ");
+  const targetNames = new Set([
+    "node_modules", "target", "build", "dist", "vendor", "DerivedData", ".next", ".nuxt",
+    ".vercel", ".svelte-kit", ".astro"
+  ]);
 
-  try {
-    const cmd = `mdfind "(${filterQuery}) && (kMDItemContentType == 'public.folder')" ${scopeArgs}`;
-    const { stdout } = await execAsync(cmd);
-    const lines = stdout
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
+  const items: PurgeItem[] = [];
 
-    const items: PurgeItem[] = [];
-    for (const p of lines) {
-      if (fs.existsSync(p)) {
-        // Exclude nested node_modules (e.g. node_modules/library/node_modules)
-        if (p.includes("node_modules/") && path.basename(p) === "node_modules") continue;
-
-        // Exclude trash and library internal
-        if (p.includes(".Trash") || p.includes("Library/Caches")) continue;
-
-        const parent = path.dirname(p);
-        items.push({
-          name: path.basename(p),
-          path: p,
-          project: path.basename(parent),
-          isLoadingSize: true,
-        });
-      }
-    }
-    return items;
-  } catch {
-    return [];
+  for (const p of searchPaths) {
+    // Max depth of 4 relative to the base project folder should be plenty
+    await findPurgeTargetsNative(p, 1, 4, targetNames, items);
   }
+
+  return items;
 }

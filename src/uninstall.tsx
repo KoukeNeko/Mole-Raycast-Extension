@@ -14,11 +14,13 @@ interface InstalledApp {
   bundleId?: string;
   sizeBytes?: number;
   isLoadingSize?: boolean;
+  mtimeMs?: number;
 }
 
 export default function UninstallCommand() {
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [sorting, setSorting] = useState<"name" | "size" | "time">("name");
 
   async function fetchApps() {
     setIsLoading(true);
@@ -93,39 +95,62 @@ export default function UninstallCommand() {
     });
   }
 
-  // Sort apps alphabetically, but could also sort by size if they have it
   const sortedApps = useMemo(() => {
-    return [...apps].sort((a, b) => a.name.localeCompare(b.name));
-  }, [apps]);
+    return [...apps].sort((a, b) => {
+      if (sorting === "size") {
+        return (b.sizeBytes || 0) - (a.sizeBytes || 0);
+      } else if (sorting === "time") {
+        return (b.mtimeMs || 0) - (a.mtimeMs || 0);
+      } else {
+        return a.name.localeCompare(b.name);
+      }
+    });
+  }, [apps, sorting]);
 
   return (
-    <List isLoading={isLoading} searchBarPlaceholder="Search applications to uninstall...">
-      {sortedApps.map((app) => (
-        <List.Item
-          key={app.path}
-          icon={{ fileIcon: app.path }}
-          title={app.name}
-          subtitle={app.bundleId}
-          accessories={
-            app.sizeBytes
-              ? [{ text: formatBytesShort(app.sizeBytes) }]
-              : app.isLoadingSize !== false
-                ? [{ text: "Calculating..." }]
-                : []
-          }
-          actions={
-            <ActionPanel>
-              <Action
-                title="Uninstall App"
-                icon={Icon.Trash}
-                style={Action.Style.Destructive}
-                onAction={() => uninstallApp(app)}
-              />
-              <Action.ShowInFinder title="Show in Finder" path={app.path} />
-            </ActionPanel>
-          }
-        />
-      ))}
+    <List
+      isLoading={isLoading}
+      searchBarPlaceholder="Search applications to uninstall..."
+      searchBarAccessory={
+        <List.Dropdown
+          tooltip="Sort Applications"
+          value={sorting}
+          onChange={(newValue) => setSorting(newValue as "name" | "size" | "time")}
+        >
+          <List.Dropdown.Item title="Sort by Name (A-Z)" value="name" />
+          <List.Dropdown.Item title="Sort by Size" value="size" />
+          <List.Dropdown.Item title="Sort by Add Time" value="time" />
+        </List.Dropdown>
+      }
+    >
+      <List.Section title={`Installed Applications (${sortedApps.length})`}>
+        {sortedApps.map((app) => (
+          <List.Item
+            key={app.path}
+            icon={{ fileIcon: app.path }}
+            title={app.name}
+            subtitle={app.bundleId}
+            accessories={
+              app.sizeBytes
+                ? [{ text: formatBytesShort(app.sizeBytes) }]
+                : app.isLoadingSize !== false
+                  ? [{ text: "Calculating..." }]
+                  : []
+            }
+            actions={
+              <ActionPanel>
+                <Action
+                  title="Uninstall App"
+                  icon={Icon.Trash}
+                  style={Action.Style.Destructive}
+                  onAction={() => uninstallApp(app)}
+                />
+                <Action.ShowInFinder title="Show in Finder" path={app.path} />
+              </ActionPanel>
+            }
+          />
+        ))}
+      </List.Section>
     </List>
   );
 }
@@ -207,6 +232,7 @@ async function scanApps(): Promise<InstalledApp[]> {
             path: appPath,
             bundleId,
             isLoadingSize: true,
+            mtimeMs: fs.statSync(appPath).mtimeMs,
           });
         }
       }
@@ -222,10 +248,12 @@ async function scanApps(): Promise<InstalledApp[]> {
       const entries = fs.readdirSync(setappDir, { withFileTypes: true });
       for (const entry of entries) {
         if (entry.isDirectory() && entry.name.endsWith(".app")) {
+          const appPath = path.join(setappDir, entry.name);
           apps.push({
             name: entry.name.replace(".app", ""),
-            path: path.join(setappDir, entry.name),
+            path: appPath,
             isLoadingSize: true,
+            mtimeMs: fs.statSync(appPath).mtimeMs,
           });
         }
       }
