@@ -1,0 +1,73 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "mole",
+  "title": "Mole",
+  "description": "🐹 Deep clean and optimize your Mac with Mole — all within Raycast.",
+  "icon": "extension-icon.png",
+  "author": "doeshing",
+  "platforms": [
+    "macOS"
+  ],
+  "categories": [
+    "System"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "mole",
+      "title": "Mole",
+      "description": "Main menu — access all Mole features",
+      "mode": "view"
+    },
+    {
+      "name": "clean",
+      "title": "Mole Clean",
+      "description": "Deep cleanup — scan and free up disk space",
+      "mode": "view"
+    },
+    {
+      "name": "optimize",
+      "title": "Mole Optimize",
+      "description": "System optimization — maintain and tune your Mac",
+      "mode": "view"
+    },
+    {
+      "name": "status",
+      "title": "Mole Status",
+      "description": "System health — CPU, memory, disk stats",
+      "mode": "view"
+    },
+    {
+      "name": "uninstall",
+      "title": "Mole Uninstall",
+      "description": "App uninstaller — remove apps and leftovers",
+      "mode": "view"
+    },
+    {
+      "name": "analyze",
+      "title": "Mole Analyze",
+      "description": "Disk explorer — browse folders by size",
+      "mode": "view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.6",
+    "@raycast/utils": "^1.17.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^2.0.4",
+    "@types/node": "22.13.10",
+    "@types/react": "19.0.10",
+    "eslint": "^9.22.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint",
+    "prepublishOnly": "echo \"\\n\\nIt seems like you are trying to publish the Raycast extension to npm.\\n\\nIf you did intend to publish it to npm, remove the \\`prepublishOnly\\` script and rerun \\`npm publish\\` again.\\nIf you wanted to publish it to the Raycast Store instead, use \\`npm run publish\\` instead.\\n\\n\" && exit 1",
+    "publish": "npx @raycast/api@latest publish"
+  }
+}
