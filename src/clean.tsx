@@ -51,9 +51,16 @@ export default function CleanCommand() {
     }
 
     async function executeClean() {
+        // Compute total from parsed categories as fallback
+        const computedTotal = categories
+            .flatMap((c) => c.items)
+            .map((i) => parseSizeToBytes(i.size))
+            .reduce((a, b) => a + b, 0);
+        const totalDisplay = summary?.totalSize || (computedTotal > 0 ? formatBytesShort(computedTotal) : "");
+
         await confirmAndExecute({
             title: "確認清理？",
-            message: `將清理約 ${summary?.totalSize || "未知大小"} 的快取、日誌和暫存檔案。此操作無法復原。`,
+            message: `將清理約 ${totalDisplay} 的快取、日誌和暫存檔案。此操作無法復原。`,
             primaryAction: "執行清理",
             onConfirm: async () => {
                 await execMo(["clean"]);
