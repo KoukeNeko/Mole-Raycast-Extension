@@ -4,38 +4,70 @@ Deep clean and optimize your Mac directly from Raycast. This extension serves as
 
 ## Commands
 
-- **Mole Dashboard**: Central dashboard for system status, updates, and settings.
-- **System Optimizer**: Rebuild caches, clear DNS, and optimize macOS performance.
-- **Deep Clean**: Remove caches, logs, and unneeded system files.
-- **App Uninstaller**: Completely remove applications and their associated Library files.
-- **Project Purger**: Find and remove heavy `node_modules`, `target`, `build`, and `dist` folders.
-- **Installer Cleaner**: Detect and clean left-over `.dmg`, `.pkg`, `.zip`, and `.xip` files.
+| Command | Description |
+|---------|-------------|
+| **Mole Dashboard** | Central dashboard for system status, updates, and settings |
+| **Mole Clean** | Streaming deep clean — scan and free up disk space with 1:1 CLI output parity |
+| **Mole Optimize** | Rebuild caches, clear DNS, and optimize macOS performance |
+| **Mole Purge** | Find and remove `node_modules`, `build`, `dist`, `.next` and other project artifacts, grouped by type |
+| **Mole Uninstall** | Completely remove applications and their associated Library files |
+| **Mole Installer** | Detect and clean leftover `.dmg`, `.pkg`, `.zip`, and `.xip` installer files |
+| **Mole Analyze** | Disk explorer — browse folders by size |
+| **Mole Settings** | Manage whitelist paths, purge paths, and extension configuration |
+
+## Features
+
+- **Real-time streaming output** — Mole Clean streams the CLI output line-by-line as it scans, giving instant visual feedback
+- **1:1 CLI parity** — Every category and item from `mo clean --dry-run` is rendered faithfully in the Raycast UI
+- **Smart grouping** — Clean categories with nothing to clean show a ✓ checkmark accessory; Purge items are grouped by artifact type (`node_modules`, `build`, `dist`, etc.)
+- **Per-category cleaning** — Select individual categories to clean instead of doing everything at once
+- **i18n support** — Extension preferences include a language dropdown (Auto / English / 繁體中文)
+- **Whitelist at bottom** — The Whitelist category always stays pinned to the bottom of the clean results
 
 ---
 
 ## Technical Architecture & Design
 
-While this extension is designed to interface with the `mo` CLI tool, **certain features have been rewritten natively in Node.js/TypeScript** to provide a better, faster, and more interactive Raycast experience. 
+While this extension is designed to interface with the `mo` CLI tool, **certain features have been rewritten natively in Node.js/TypeScript** to provide a better, faster, and more interactive Raycast experience.
 
 ### Native Raycast Implementations (Does NOT use `mo` CLI backend)
 
 To provide real-time UI feedback, live calculating sizes, and interactive checkboxes, the following commands execute natively using Node.js filesystem (`fs`) APIs and `child_process` strictly for size calculation. **They do not call the `mo` bash script under the hood:**
 
 1. **Installer Cleaner (`mo installer`)**
-   - **How it works:** Uses a native recursive Node.js scanner (depth of 2) across common download and cache directories (including `~/Library/Caches/Homebrew`). 
-   - **Why native?** Apple's native Spotlight (`mdfind`) refuses to index `~/Library` paths natively. Replicating the `mo installer`'s `fd/find` behavior natively inside Raycast ensures we find hidden `.zip` (with installer payloads) and `.pkg` files without the overhead of calling the bash script and parsing its visual output.
+   - Uses a native recursive Node.js scanner across common download and cache directories (including `~/Library/Caches/Homebrew`).
+   - Apple's native Spotlight (`mdfind`) refuses to index `~/Library` paths, so native scanning ensures full coverage.
 2. **Project Purger (`mo purge`)**
-   - **How it works:** Native `fs` recursive scanning for `node_modules` and compiled target directories based on predefined settings.
-   - **Why native?** Allows real-time progress updates and size calculations within the Raycast List UI as directories are discovered.
+   - Native `fs` recursive scanning for `node_modules`, `build`, `dist`, `.next`, and other compiled target directories.
+   - Scans `~/` and common project directories (`~/Documents`, `~/GitHub`, `~/Code`, etc.) with automatic deduplication.
+   - Results are grouped by artifact type into separate sections for easy browsing.
 3. **App Uninstaller (`mo uninstall`)**
-   - **How it works:** Scans `/Applications` and `~/Applications` natively.
-   - **Why native?** The `mo uninstall` CLI is heavily TUI-based (Terminal UI) and doesn't easily output headless structural data. A native implementation allows Raycast to render app icons, display calculated sizes faster, and natively bin the applications.
+   - Scans `/Applications` and `~/Applications` natively for app icon rendering, calculated sizes, and native trash support.
 
 ### CLI Wrappers (Uses `mo` CLI backend)
 
-The following commands act as wrappers, actively calling `mo` and parsing its stdout/JSON output:
+The following commands call `mo` and parse its stdout output:
 
 - **System Status Dashboard**: Parses JSON generated by `generate_health_json.sh`.
-- **System Optimizer (`mo optimize`)**: Executes `mo optimize --dry-run` to fetch optimizable targets, and runs `mo optimize` for execution.
-- **Deep Clean (`mo clean`)**: Executes `mo clean --dry-run` to get cleanable targets.
+- **System Optimizer (`mo optimize`)**: Executes `mo optimize --dry-run` to fetch optimizable targets.
+- **Deep Clean (`mo clean`)**: Streams `mo clean --dry-run` output in real-time, parsing categories, items, and sizes with full ANSI stripping and carriage return handling.
 - **Settings/Update**: Directly triggers `mo update` and `mo touchid`.
+
+---
+
+## Configuration
+
+### Language Preference
+
+Set via Raycast Extension Settings → Mole → Language:
+- **Auto (System)** — Follows your macOS system locale
+- **English**
+- **繁體中文**
+
+### Custom Purge Paths
+
+Add custom scan directories in `~/.config/mole/purge_paths` (one path per line, supports `~`).
+
+### Whitelist
+
+Manage protected paths in `~/.config/mole/whitelist` via Mole Settings or by editing the file directly.

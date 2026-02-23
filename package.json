@@ -68,6 +68,30 @@
       "mode": "view"
     }
   ],
+  "preferences": [
+    {
+      "name": "language",
+      "type": "dropdown",
+      "title": "Language",
+      "description": "Select the display language for the extension.",
+      "default": "system",
+      "required": false,
+      "data": [
+        {
+          "title": "Auto (System)",
+          "value": "system"
+        },
+        {
+          "title": "English",
+          "value": "en"
+        },
+        {
+          "title": "繁體中文",
+          "value": "zh-TW"
+        }
+      ]
+    }
+  ],
   "dependencies": {
     "@raycast/api": "^1.104.6",
     "@raycast/utils": "^1.17.0"

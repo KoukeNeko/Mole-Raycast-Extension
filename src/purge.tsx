@@ -131,35 +131,47 @@ export default function PurgeCommand() {
         />
       )}
 
-      <List.Section title={`Found ${items.length} build directories`}>
-        {sortedItems.map((item) => (
-          <List.Item
-            key={item.path}
-            icon={{ source: Icon.Box, tintColor: Color.Blue }}
-            title={item.project}
-            subtitle={item.name}
-            accessories={
-              item.sizeBytes
-                ? [{ text: formatBytesShort(item.sizeBytes) }]
-                : item.isLoadingSize !== false
-                  ? [{ text: "Calculating..." }]
-                  : []
-            }
-            actions={
-              <ActionPanel>
-                <Action
-                  title="Purge Folder"
-                  icon={Icon.Trash}
-                  style={Action.Style.Destructive}
-                  onAction={() => purgeItem(item)}
-                />
-                <Action.ShowInFinder title="Show in Finder" path={item.path} />
-                <Action.CopyToClipboard title="Copy Path" content={item.path} />
-              </ActionPanel>
-            }
-          />
-        ))}
-      </List.Section>
+      {(() => {
+        // Group items by artifact type (e.g. node_modules, build, dist)
+        const groups = new Map<string, typeof sortedItems>();
+        for (const item of sortedItems) {
+          const list = groups.get(item.name) || [];
+          list.push(item);
+          groups.set(item.name, list);
+        }
+
+        return Array.from(groups.entries()).map(([artifactType, groupItems]) => (
+          <List.Section key={artifactType} title={artifactType} subtitle={`${groupItems.length} items`}>
+            {groupItems.map((item) => (
+              <List.Item
+                key={item.path}
+                icon={{ source: Icon.Box, tintColor: Color.Blue }}
+                title={item.project}
+                subtitle={item.path.replace(process.env.HOME || "", "~")}
+                accessories={
+                  item.sizeBytes
+                    ? [{ text: formatBytesShort(item.sizeBytes) }]
+                    : item.isLoadingSize !== false
+                      ? [{ text: "Calculating..." }]
+                      : []
+                }
+                actions={
+                  <ActionPanel>
+                    <Action
+                      title="Purge Folder"
+                      icon={Icon.Trash}
+                      style={Action.Style.Destructive}
+                      onAction={() => purgeItem(item)}
+                    />
+                    <Action.ShowInFinder title="Show in Finder" path={item.path} />
+                    <Action.CopyToClipboard title="Copy Path" content={item.path} />
+                  </ActionPanel>
+                }
+              />
+            ))}
+          </List.Section>
+        ));
+      })()}
 
       {!isLoading && items.length === 0 && (
         <List.EmptyView icon={Icon.Checkmark} title="No project caches found!" description="Your projects are clean." />
@@ -205,7 +217,7 @@ async function findPurgeTargetsNative(dir: string, currentDepth: number, maxDept
 
 async function discoverPurgeTargets(): Promise<PurgeItem[]> {
   const home = process.env.HOME || "";
-  const searchDirs = ["www", "dev", "Projects", "GitHub", "Code", "Workspace", "Repos", "Development", ""];
+  const searchDirs = ["www", "dev", "Projects", "GitHub", "Code", "Workspace", "Repos", "Development", "Documents", ""];
 
   const searchPaths = searchDirs
     .map((d) => path.join(home, d))
@@ -242,5 +254,11 @@ async function discoverPurgeTargets(): Promise<PurgeItem[]> {
     await findPurgeTargetsNative(p, 1, 4, targetNames, items);
   }
 
-  return items;
+  // Deduplicate by path (overlapping search roots can find the same target)
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.path)) return false;
+    seen.add(item.path);
+    return true;
+  });
 }
