@@ -1,20 +1,99 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
 import { useEffect, useState, useMemo } from "react";
-import { exec } from "child_process";
-import { promisify } from "util";
-import fs from "fs";
 import path from "path";
-import { formatBytesShort, confirmAndExecute, trashPaths } from "./utils";
+import { execMo, confirmAndExecute, trashPaths, stripAnsi } from "./utils";
 
-const execAsync = promisify(exec);
+// --- Constants ---
+
+const HOME = process.env.HOME || "";
+
+// --- Types ---
 
 interface PurgeItem {
   name: string;
   path: string;
   project: string;
-  sizeBytes?: number;
-  isLoadingSize?: boolean;
+  sizeBytes: number;
+  isRecent: boolean;
 }
+
+// --- CLI Output Parsing ---
+
+/** Parse a human-readable size string (e.g. "527.2MB", "660KB", "2.34GB") into bytes. */
+function parseSizeString(sizeStr: string): number {
+  const match = sizeStr.match(/^([\d.]+)\s*(B|KB|MB|GB|TB)$/i);
+  if (!match) return 0;
+
+  const value = parseFloat(match[1]);
+  const unit = match[2].toUpperCase();
+
+  const multipliers: Record<string, number> = {
+    B: 1,
+    KB: 1024,
+    MB: 1024 ** 2,
+    GB: 1024 ** 3,
+    TB: 1024 ** 4,
+  };
+
+  return Math.round(value * (multipliers[unit] || 1));
+}
+
+/** Expand `~` prefix to the user's home directory. */
+function expandTilde(p: string): string {
+  if (p.startsWith("~/")) return path.join(HOME, p.slice(2));
+  if (p === "~") return HOME;
+  return p;
+}
+
+/**
+ * Parse `mo purge --dry-run` output into PurgeItem[].
+ *
+ * Expected line format:
+ *   → ~/Documents/GitHub/project  527.2MB  |  node_modules
+ *   → ~/Documents/GitHub/app  285.3MB  |  node_modules  [Recent]
+ */
+function parseDryRunOutput(output: string): PurgeItem[] {
+  const items: PurgeItem[] = [];
+
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = stripAnsi(rawLine).trim();
+
+    // Match: → <path>  <size>  |  <artifact>  [Recent]?
+    const match = line.match(/^→\s+(.+?)\s+([\d.]+\s*(?:B|KB|MB|GB|TB))\s+\|\s+(\S+)(.*)$/i);
+    if (!match) continue;
+
+    const projectPath = match[1].trim();
+    const sizeStr = match[2].trim();
+    const artifactName = match[3].trim();
+    const trailing = match[4] || "";
+    const isRecent = trailing.includes("[Recent]");
+
+    const absoluteProjectPath = expandTilde(projectPath);
+    const artifactFullPath = path.join(absoluteProjectPath, artifactName);
+    const projectName = path.basename(absoluteProjectPath);
+
+    items.push({
+      name: artifactName,
+      path: artifactFullPath,
+      project: projectName,
+      sizeBytes: parseSizeString(sizeStr),
+      isRecent,
+    });
+  }
+
+  return items;
+}
+
+// --- Size Formatting ---
+
+function formatBytesShort(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
+// --- Component ---
 
 export default function PurgeCommand() {
   const [items, setItems] = useState<PurgeItem[]>([]);
@@ -24,10 +103,16 @@ export default function PurgeCommand() {
     async function scan() {
       setIsLoading(true);
       try {
-        const found = await discoverPurgeTargets();
+        const output = await execMo(["purge", "--dry-run"]);
+        console.error("================ PURGE RUN ================");
+        console.error("[purge] raw output length:", output.length);
+        console.error("[purge] first 300 chars:", output.substring(0, 300));
+        const found = parseDryRunOutput(output);
+        console.error("[purge] items found:", found.length);
+        if (found.length > 0) console.error("Found:", found[0]);
         setItems(found);
-        calculateSizes(found);
       } catch (err) {
+        console.error("[purge] ERROR:", err);
         showToast({ style: Toast.Style.Failure, title: "Failed to scan projects", message: String(err) });
       } finally {
         setIsLoading(false);
@@ -35,29 +120,6 @@ export default function PurgeCommand() {
     }
     scan();
   }, []);
-
-  async function calculateSizes(initialItems: PurgeItem[]) {
-    // Process in batches so we don't spawn 1000 'du' processes
-    const batchSize = 10;
-    for (let i = 0; i < initialItems.length; i += batchSize) {
-      const batch = initialItems.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map(async (item) => {
-          try {
-            const { stdout } = await execAsync(`du -sk "${item.path}"`);
-            const sizeKb = parseInt(stdout.split("\t")[0], 10);
-            if (!isNaN(sizeKb)) {
-              setItems((prev) =>
-                prev.map((p) => (p.path === item.path ? { ...p, sizeBytes: sizeKb * 1024, isLoadingSize: false } : p)),
-              );
-            }
-          } catch {
-            setItems((prev) => prev.map((p) => (p.path === item.path ? { ...p, isLoadingSize: false } : p)));
-          }
-        }),
-      );
-    }
-  }
 
   async function purgeItem(item: PurgeItem) {
     await confirmAndExecute({
@@ -79,13 +141,11 @@ export default function PurgeCommand() {
   }
 
   async function purgeAll() {
-    const totalSize = items.reduce((acc, curr) => acc + (curr.sizeBytes || 0), 0);
-    const hasPending = items.some((i) => i.isLoadingSize);
-    const sizeStr = hasPending ? "計算中..." : formatBytesShort(totalSize);
+    const totalSize = items.reduce((acc, curr) => acc + curr.sizeBytes, 0);
 
     await confirmAndExecute({
       title: "清理所有專案快取？",
-      message: `即將清理約 ${sizeStr} 的專案建置檔與相依套件。此操作會將所有列出的資料夾移至垃圾桶。`,
+      message: `即將清理約 ${formatBytesShort(totalSize)} 的專案建置檔與相依套件。此操作會將所有列出的資料夾移至垃圾桶。`,
       primaryAction: "全部清理",
       onConfirm: async () => {
         await showToast({ style: Toast.Style.Animated, title: "Purging all items..." });
@@ -106,7 +166,6 @@ export default function PurgeCommand() {
 
   const sortedItems = useMemo(() => {
     return [...items].sort((a, b) => {
-      // Sort by size descending, then by project name
       const sizeA = a.sizeBytes || 0;
       const sizeB = b.sizeBytes || 0;
       if (sizeA !== sizeB) return sizeB - sizeA;
@@ -114,7 +173,7 @@ export default function PurgeCommand() {
     });
   }, [items]);
 
-  const totalSize = items.reduce((acc, curr) => acc + (curr.sizeBytes || 0), 0);
+  const totalSize = items.reduce((acc, curr) => acc + curr.sizeBytes, 0);
 
   return (
     <List isLoading={isLoading} searchBarPlaceholder="Search project caches...">
@@ -145,16 +204,13 @@ export default function PurgeCommand() {
             {groupItems.map((item) => (
               <List.Item
                 key={item.path}
-                icon={{ source: Icon.Box, tintColor: Color.Blue }}
+                icon={{ source: Icon.Box, tintColor: item.isRecent ? Color.Yellow : Color.Blue }}
                 title={item.project}
-                subtitle={item.path.replace(process.env.HOME || "", "~")}
-                accessories={
-                  item.sizeBytes
-                    ? [{ text: formatBytesShort(item.sizeBytes) }]
-                    : item.isLoadingSize !== false
-                      ? [{ text: "Calculating..." }]
-                      : []
-                }
+                subtitle={item.path.replace(HOME, "~")}
+                accessories={[
+                  ...(item.isRecent ? [{ tag: { value: "Recent", color: Color.Yellow } }] : []),
+                  { text: formatBytesShort(item.sizeBytes) },
+                ]}
                 actions={
                   <ActionPanel>
                     <Action
@@ -178,87 +234,4 @@ export default function PurgeCommand() {
       )}
     </List>
   );
-}
-
-// --- Scanner Helpers ---
-
-async function findPurgeTargetsNative(dir: string, currentDepth: number, maxDepth: number, targets: Set<string>, results: PurgeItem[]) {
-  if (currentDepth > maxDepth) return;
-  try {
-    const ents = fs.readdirSync(dir, { withFileTypes: true });
-    for (const ent of ents) {
-      if (!ent.isDirectory()) continue;
-
-      const name = ent.name;
-      // Skip hidden directories like .git or protected paths except those we are looking for like .next
-      if ((name.startsWith(".") && !targets.has(name)) || name === "Library" || name === "System") {
-        continue;
-      }
-
-      const fullPath = path.join(dir, name);
-
-      if (targets.has(name)) {
-        // We found a target, add it and DO NOT descend further (e.g., skip nested node_modules)
-        results.push({
-          name: name,
-          path: fullPath,
-          project: path.basename(dir), // Parent directory is the project name
-          isLoadingSize: true,
-        });
-      } else {
-        // Not a target, keep digging
-        await findPurgeTargetsNative(fullPath, currentDepth + 1, maxDepth, targets, results);
-      }
-    }
-  } catch {
-    // ignore access errors
-  }
-}
-
-async function discoverPurgeTargets(): Promise<PurgeItem[]> {
-  const home = process.env.HOME || "";
-  const searchDirs = ["www", "dev", "Projects", "GitHub", "Code", "Workspace", "Repos", "Development", "Documents", ""];
-
-  const searchPaths = searchDirs
-    .map((d) => path.join(home, d))
-    .filter((p) => fs.existsSync(p));
-
-  // Add the custom mole config path if it exists
-  const molePathsConfig = path.join(home, ".config/mole/purge_paths");
-  if (fs.existsSync(molePathsConfig)) {
-    try {
-      const customPaths = fs.readFileSync(molePathsConfig, "utf8")
-        .split("\n")
-        .map(l => l.trim())
-        .filter(l => l && !l.startsWith("#"));
-      for (let p of customPaths) {
-        if (p.startsWith("~/")) p = path.join(home, p.slice(2));
-        if (fs.existsSync(p) && !searchPaths.includes(p)) {
-          searchPaths.push(p);
-        }
-      }
-    } catch { }
-  }
-
-  if (searchPaths.length === 0) return [];
-
-  const targetNames = new Set([
-    "node_modules", "target", "build", "dist", "vendor", "DerivedData", ".next", ".nuxt",
-    ".vercel", ".svelte-kit", ".astro"
-  ]);
-
-  const items: PurgeItem[] = [];
-
-  for (const p of searchPaths) {
-    // Max depth of 4 relative to the base project folder should be plenty
-    await findPurgeTargetsNative(p, 1, 4, targetNames, items);
-  }
-
-  // Deduplicate by path (overlapping search roots can find the same target)
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    if (seen.has(item.path)) return false;
-    seen.add(item.path);
-    return true;
-  });
 }

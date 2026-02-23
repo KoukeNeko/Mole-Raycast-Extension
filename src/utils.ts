@@ -1,6 +1,6 @@
 import { exec, execFile } from "child_process";
 import { promisify } from "util";
-import { showToast, Toast, confirmAlert, Alert, trash } from "@raycast/api";
+import { showToast, Toast, confirmAlert, Alert, trash, environment } from "@raycast/api";
 import { existsSync, statSync, readdirSync } from "fs";
 import path from "path";
 
@@ -11,9 +11,21 @@ const execFileAsync = promisify(execFile);
 
 /** Resolve the bundled Mole CLI from the submodule (relative to this extension's source root). */
 function getBundledMoPath(): string {
-  // At runtime, __dirname points to the compiled output directory.
-  // The submodule lives at <extension-root>/Mole/mo
-  const extensionRoot = path.resolve(__dirname, "..");
+  // Raycast copies output to ~/.config/raycast/extensions/mole.
+  // The Mole submodule is NOT copied there. For local dev, hardcode the project path:
+  const devPath = path.join(
+    process.env.HOME || "",
+    "Documents",
+    "GitHub",
+    "Raycast Extensions",
+    "mole",
+    "Mole",
+    "mo"
+  );
+  if (existsSync(devPath)) return devPath;
+
+  // Fallback if bundled in production
+  const extensionRoot = path.resolve(environment.assetsPath, "..");
   return path.join(extensionRoot, "Mole", "mo");
 }
 
@@ -29,7 +41,7 @@ const BYTES_PER_KB = 1024;
 
 // --- Path Detection ---
 
-let cachedMoPath: string | null = null;
+let cachedMoPath = "";
 
 export async function getMoPath(): Promise<string> {
   if (cachedMoPath) return cachedMoPath;
