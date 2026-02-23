@@ -23,6 +23,7 @@ interface CleanCategory {
 interface CleanItem {
   description: string;
   size: string;
+  icon?: Icon;
 }
 
 interface CleanSummary {
@@ -109,6 +110,7 @@ export default function CleanCommand() {
         // 1:1 catch all processing starts:
         let description = stripped;
         let size = "";
+        let customIcon: Icon | undefined;
 
         // Remove leading arrows, bullets, checkmarks for clean item name formatting
         const cleanItemName = stripped.replace(/^[→•✓⚙]\s*/, "");
@@ -121,13 +123,18 @@ export default function CleanCommand() {
             categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
             setCategories(getSortedCategories(categoriesRef.current, null));
           }
-          currentCategoryRef.current = { name: "Whitelist", items: [], totalSize: "" };
-          // Don't return, let it process the "Whitelist: 20 core patterns active" text as an item in the new category
+          currentCategoryRef.current = {
+            name: "Whitelist",
+            items: [],
+            totalSize: cleanItemName.substring("Whitelist:".length).trim()
+          };
+          return; // Skip adding this title line as a child item
         }
 
         // Scanning progress: • description
         if (stripped.startsWith("•")) {
           setScanStatus(cleanItemName);
+          if (cleanItemName.includes("· scanning")) return; // Don't persist scanning indicators as items
         }
 
         // Default: raw string becomes description
@@ -154,7 +161,8 @@ export default function CleanCommand() {
           description.startsWith("===") ||
           description.includes("Detailed file list:") ||
           description.includes("Dry run complete") ||
-          description.includes("Use ")
+          description.includes("Use ") ||
+          lowerDesc.includes("runtime volumes total:")
         ) return;
 
         // If it looks like: "description, SIZE dry"
@@ -163,17 +171,29 @@ export default function CleanCommand() {
           description = dryMatch[1];
           size = dryMatch[2];
         } else {
-          // Item: "description · would clean/empty"
-          const wouldMatch = stripped.match(/^[→•✓⚙]?\s*(.+?)\s*·\s*would\s+(.+)/);
-          if (wouldMatch) {
-            description = `${wouldMatch[1]} (would ${wouldMatch[2]})`;
+          // Check for UNUSED sub-items (e.g. "UNUSED 0B · /Library/...")
+          const unusedMatch = stripped.match(/^[→•✓⚙]?\s*UNUSED\s+([\d.]+\s*\w+)\s+·\s+(.+)$/);
+          if (unusedMatch) {
+            description = unusedMatch[2]; // Path
+            size = unusedMatch[1]; // 0B
+            customIcon = Icon.ArrowRight;
+          } else {
+            // Item: "description · would clean/empty"
+            const wouldMatch = stripped.match(/^[→•✓⚙]?\s*(.+?)\s*·\s*would\s+(.+)/);
+            if (wouldMatch) {
+              description = wouldMatch[1].trim();
+              size = `(would ${wouldMatch[2].trim()})`;
+            } else {
+              // Use the pre-cleaned name stripped of arrows/bullets for plain info items
+              description = cleanItemName;
+            }
           }
         }
 
         // Ignore summary box footer separators
         if (description.startsWith("===") || description.includes("Detailed file list:")) return;
 
-        currentCategoryRef.current.items.push({ description, size });
+        currentCategoryRef.current.items.push({ description, size, icon: customIcon });
         finalizeCategorySize(currentCategoryRef.current);
         // Update immediately so user sees the item appear
         setCategories(getSortedCategories(categoriesRef.current, currentCategoryRef.current));
@@ -309,7 +329,7 @@ export default function CleanCommand() {
                 {category.items.map((item, idx) => (
                   <List.Item
                     key={`${category.name}-${idx}`}
-                    icon={{ source: getCategoryIcon(category.name), tintColor: getSizeColor(item.size) }}
+                    icon={{ source: item.icon || getCategoryIcon(category.name), tintColor: getSizeColor(item.size) }}
                     title={item.description}
                     accessories={item.size ? [{ text: item.size }] : []}
                     actions={
