@@ -48,8 +48,16 @@ export async function getMoPath(): Promise<string> {
 }
 
 function buildShellPath(): string {
-  const paths = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin", `${process.env.HOME}/.local/bin`];
-  return paths.join(":");
+  const paths = [
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/opt/homebrew/bin",
+    `${process.env.HOME}/.local/bin`,
+  ];
+  return `${paths.join(":")}:${process.env.PATH || ""}`;
 }
 
 // --- Command Execution ---
@@ -124,19 +132,25 @@ export function spawnMoStreaming(args: string[], onLine: (line: string) => void)
     let buffer = "";
     proc.stdout.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
-      const lines = buffer.split("\n");
+      const lines = buffer.split(/\r\n|\n|\r/);
       buffer = lines.pop() || ""; // keep incomplete last line
       for (const line of lines) {
         onLine(line);
+        try { require("fs").appendFileSync("/Users/doeshing/.cache/mole/raycast-stream.log", line + "\n"); } catch (e) { }
       }
     });
 
     proc.on("close", () => {
-      if (buffer.trim()) onLine(buffer);
+      try { require("fs").appendFileSync("/Users/doeshing/.cache/mole/raycast-stream.log", "--- CLOSE ---" + "\n"); } catch (e) { }
+      if (buffer.trim()) {
+        onLine(buffer);
+        try { require("fs").appendFileSync("/Users/doeshing/.cache/mole/raycast-stream.log", buffer + "\n"); } catch (e) { }
+      }
       resolve();
     });
 
     proc.on("error", (err: Error) => {
+      try { require("fs").appendFileSync("/Users/doeshing/.cache/mole/raycast-stream.log", "--- ERROR ---" + err.message + "\n"); } catch (e) { }
       reject(new Error(`mo ${args.join(" ")} failed: ${err.message}`));
     });
 
@@ -195,7 +209,7 @@ export function parseDryRunOutput(output: string): CleanCategory[] {
   const categories: CleanCategory[] = [];
   let currentCategory: CleanCategory | null = null;
 
-  for (const line of output.split("\n")) {
+  for (const line of output.split(/\r\n|\n|\r/)) {
     const stripped = stripAnsi(line).trim();
     if (!stripped) continue;
 

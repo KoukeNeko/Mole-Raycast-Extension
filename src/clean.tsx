@@ -17,6 +17,7 @@ interface CleanCategory {
   name: string;
   items: CleanItem[];
   totalSize: string;
+  emptyReason?: string;
 }
 
 interface CleanItem {
@@ -31,6 +32,18 @@ interface CleanSummary {
 }
 
 // --- Command ---
+
+function getSortedCategories(finalized: CleanCategory[], current: CleanCategory | null): CleanCategory[] {
+  const all = [...finalized];
+  if (current) all.push(current);
+
+  const whitelistIndex = all.findIndex((c) => c.name === "Whitelist");
+  if (whitelistIndex !== -1) {
+    const [whitelist] = all.splice(whitelistIndex, 1);
+    all.push(whitelist);
+  }
+  return all;
+}
 
 export default function CleanCommand() {
   const [categories, setCategories] = useState<CleanCategory[]>([]);
@@ -53,14 +66,17 @@ export default function CleanCommand() {
     setSummary(null);
     setScanStatus("正在掃描...");
     categoriesRef.current = [];
-    currentCategoryRef.current = null;
+    currentCategoryRef.current = { name: "系統資訊", items: [], totalSize: "" }; // Catch pre-header outputs
 
     try {
       await spawnMoStreaming(["clean", "--dry-run"], (line) => {
-        if (currentScanIdRef.current !== scanId) return; // Prevent concurrent streams making duplicates
+        if (currentScanIdRef.current !== scanId) return;
 
         const stripped = stripAnsi(line).trim();
         if (!stripped) return;
+
+        // Skip the very first title lines that are generic
+        if (stripped === "Clean Your Mac" || stripped.includes("Dry Run Mode")) return;
 
         // Summary line
         const summaryMatch = stripped.match(
@@ -75,15 +91,14 @@ export default function CleanCommand() {
           return;
         }
 
-        // Section header: ➤ Category name
-        if (stripped.startsWith("➤")) {
-          // Push previous category
-          if (currentCategoryRef.current) {
+        // Section header: ➤/▶ Category name
+        if (stripped.startsWith("➤") || stripped.startsWith("▶")) {
+          if (currentCategoryRef.current && (currentCategoryRef.current.items.length > 0 || currentCategoryRef.current.emptyReason)) {
             finalizeCategorySize(currentCategoryRef.current);
             categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
-            setCategories([...categoriesRef.current]);
+            setCategories(getSortedCategories(categoriesRef.current, null));
           }
-          const name = stripped.replace(/^➤\s*/, "").trim();
+          const name = stripped.replace(/^[➤▶]\s*/, "").trim();
           currentCategoryRef.current = { name, items: [], totalSize: "" };
           setScanStatus(`正在掃描 ${name}...`);
           return;
@@ -91,49 +106,88 @@ export default function CleanCommand() {
 
         if (!currentCategoryRef.current) return;
 
-        // Item: → description, SIZE dry
-        const dryMatch = stripped.match(/^→\s*(.+?),\s*([\d.]+\s*\w+)\s*dry$/);
-        if (dryMatch) {
-          currentCategoryRef.current.items.push({ description: dryMatch[1], size: dryMatch[2] });
-          finalizeCategorySize(currentCategoryRef.current);
-          // Update immediately so user sees the item appear
-          setCategories([...categoriesRef.current, currentCategoryRef.current]);
-          return;
-        }
+        // 1:1 catch all processing starts:
+        let description = stripped;
+        let size = "";
 
-        // Item: → description · would clean/empty
-        const wouldMatch = stripped.match(/^→\s*(.+?)\s*·\s*would\s+(.+)/);
-        if (wouldMatch) {
-          currentCategoryRef.current.items.push({
-            description: `${wouldMatch[1]} (would ${wouldMatch[2]})`,
-            size: "",
-          });
-          setCategories([...categoriesRef.current, currentCategoryRef.current]);
-          return;
-        }
+        // Remove leading arrows, bullets, checkmarks for clean item name formatting
+        const cleanItemName = stripped.replace(/^[→•✓⚙]\s*/, "");
 
-        // Item: → description (no size, not a path)
-        const simpleMatch = stripped.match(/^→\s*(.+)/);
-        if (simpleMatch && !simpleMatch[1].startsWith("/")) {
-          currentCategoryRef.current.items.push({ description: simpleMatch[1], size: "" });
-          setCategories([...categoriesRef.current, currentCategoryRef.current]);
-          return;
+        // Determine if we should split off into a Whitelist category
+        if (cleanItemName.startsWith("Whitelist:")) {
+          // Output previous category (which would be "系統資訊" containing the Apple Silicon info)
+          if (currentCategoryRef.current && (currentCategoryRef.current.items.length > 0 || currentCategoryRef.current.emptyReason)) {
+            finalizeCategorySize(currentCategoryRef.current);
+            categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
+            setCategories(getSortedCategories(categoriesRef.current, null));
+          }
+          currentCategoryRef.current = { name: "Whitelist", items: [], totalSize: "" };
+          // Don't return, let it process the "Whitelist: 20 core patterns active" text as an item in the new category
         }
 
         // Scanning progress: • description
         if (stripped.startsWith("•")) {
-          setScanStatus(stripped.replace(/^•\s*/, ""));
+          setScanStatus(cleanItemName);
         }
+
+        // Default: raw string becomes description
+        description = stripped;
+
+        // Extract lowercase for easier checks
+        const lowerDesc = cleanItemName.toLowerCase();
+
+        // Check if nothing to clean or informational text that involves no action
+        const isAlreadyClean =
+          lowerDesc.includes("nothing to clean") ||
+          lowerDesc.includes("already clean") ||
+          lowerDesc.includes("no incomplete backups found") ||
+          lowerDesc.includes("no large items detected") ||
+          (lowerDesc.includes("found") && lowerDesc.includes("active/installed apps"));
+
+        if (isAlreadyClean) {
+          currentCategoryRef.current.emptyReason = cleanItemName;
+          return;
+        }
+
+        // Ignore summary box footer separators and CLI help tips
+        if (
+          description.startsWith("===") ||
+          description.includes("Detailed file list:") ||
+          description.includes("Dry run complete") ||
+          description.includes("Use ")
+        ) return;
+
+        // If it looks like: "description, SIZE dry"
+        const dryMatch = stripped.match(/^[→•✓⚙]?\s*(.+?),\s*([\d.]+\s*\w+)\s*dry$/);
+        if (dryMatch) {
+          description = dryMatch[1];
+          size = dryMatch[2];
+        } else {
+          // Item: "description · would clean/empty"
+          const wouldMatch = stripped.match(/^[→•✓⚙]?\s*(.+?)\s*·\s*would\s+(.+)/);
+          if (wouldMatch) {
+            description = `${wouldMatch[1]} (would ${wouldMatch[2]})`;
+          }
+        }
+
+        // Ignore summary box footer separators
+        if (description.startsWith("===") || description.includes("Detailed file list:")) return;
+
+        currentCategoryRef.current.items.push({ description, size });
+        finalizeCategorySize(currentCategoryRef.current);
+        // Update immediately so user sees the item appear
+        setCategories(getSortedCategories(categoriesRef.current, currentCategoryRef.current));
       });
 
       if (currentScanIdRef.current !== scanId) return;
 
       // Push final category
-      if (currentCategoryRef.current) {
+      if (currentCategoryRef.current && (currentCategoryRef.current.items.length > 0 || currentCategoryRef.current.emptyReason)) {
         finalizeCategorySize(currentCategoryRef.current);
         categoriesRef.current = [...categoriesRef.current, currentCategoryRef.current];
-        setCategories([...categoriesRef.current]);
       }
+
+      setCategories(getSortedCategories(categoriesRef.current, null));
     } catch (err) {
       if (currentScanIdRef.current !== scanId) return;
       const message = err instanceof Error ? err.message : String(err);
@@ -191,9 +245,6 @@ export default function CleanCommand() {
     );
   }
 
-  const nonEmptyCategories = categories.filter((c) => c.items.length > 0);
-  const emptyCategories = categories.filter((c) => c.items.length === 0);
-
   return (
     <List isLoading={isLoading} searchBarPlaceholder="Search cleanup categories..." navigationTitle="Mole Clean">
       {categories.length === 0 && !isLoading ? (
@@ -233,51 +284,57 @@ export default function CleanCommand() {
             </List.Section>
           )}
 
-          {/* Categories with items */}
-          {nonEmptyCategories.map((category) => (
-            <List.Section key={category.name} title={category.name} subtitle={category.totalSize}>
-              {category.items.map((item, idx) => (
-                <List.Item
-                  key={`${category.name}-${idx}`}
-                  icon={{ source: getCategoryIcon(category.name), tintColor: getSizeColor(item.size) }}
-                  title={item.description}
-                  accessories={item.size ? [{ text: item.size }] : []}
-                  actions={
-                    <ActionPanel>
-                      <Action
-                        title={`清理 ${category.name}`}
-                        icon={Icon.Trash}
-                        style={Action.Style.Destructive}
-                        onAction={() => cleanCategory(category, runDryRun)}
-                      />
-                      <Action
-                        title="清理全部"
-                        icon={Icon.ExclamationMark}
-                        style={Action.Style.Destructive}
-                        shortcut={{ modifiers: ["cmd", "shift"], key: "delete" }}
-                        onAction={executeClean}
-                      />
-                      <Action title="重新掃描" icon={Icon.ArrowClockwise} onAction={runDryRun} />
-                    </ActionPanel>
-                  }
-                />
-              ))}
-            </List.Section>
-          ))}
+          {/* Categories */}
+          {categories.map((category) => {
+            if (category.items.length === 0) {
+              return (
+                <List.Section key={category.name} title={category.name}>
+                  <List.Item
+                    key={category.name}
+                    icon={getCategoryIcon(category.name)}
+                    title={category.name}
+                    accessories={[
+                      {
+                        text: { value: category.emptyReason || "Nothing to clean", color: Color.Green },
+                        icon: { source: Icon.Checkmark, tintColor: Color.Green },
+                      },
+                    ]}
+                  />
+                </List.Section>
+              );
+            }
 
-          {/* Clean categories */}
-          {!isLoading && emptyCategories.length > 0 && (
-            <List.Section title="Already Clean">
-              {emptyCategories.map((category) => (
-                <List.Item
-                  key={category.name}
-                  icon={{ source: Icon.Checkmark, tintColor: Color.Green }}
-                  title={category.name}
-                  accessories={[{ tag: { value: "Clean", color: Color.Green } }]}
-                />
-              ))}
-            </List.Section>
-          )}
+            return (
+              <List.Section key={category.name} title={category.name} subtitle={category.totalSize}>
+                {category.items.map((item, idx) => (
+                  <List.Item
+                    key={`${category.name}-${idx}`}
+                    icon={{ source: getCategoryIcon(category.name), tintColor: getSizeColor(item.size) }}
+                    title={item.description}
+                    accessories={item.size ? [{ text: item.size }] : []}
+                    actions={
+                      <ActionPanel>
+                        <Action
+                          title={`清理 ${category.name}`}
+                          icon={Icon.Trash}
+                          style={Action.Style.Destructive}
+                          onAction={() => cleanCategory(category, runDryRun)}
+                        />
+                        <Action
+                          title="清理全部"
+                          icon={Icon.ExclamationMark}
+                          style={Action.Style.Destructive}
+                          shortcut={{ modifiers: ["cmd", "shift"], key: "delete" }}
+                          onAction={executeClean}
+                        />
+                        <Action title="重新掃描" icon={Icon.ArrowClockwise} onAction={runDryRun} />
+                      </ActionPanel>
+                    }
+                  />
+                ))}
+              </List.Section>
+            );
+          })}
         </>
       )}
     </List>
