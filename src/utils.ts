@@ -432,7 +432,7 @@ export async function confirmAndExecute(options: {
   message: string;
   primaryAction: string;
   onConfirm: () => Promise<void>;
-}) {
+}): Promise<boolean> {
   const confirmed = await confirmAlert({
     title: options.title,
     message: options.message,
@@ -442,17 +442,19 @@ export async function confirmAndExecute(options: {
     },
   });
 
-  if (!confirmed) return;
+  if (!confirmed) return false;
 
   const toast = await showToast({ style: Toast.Style.Animated, title: "執行中..." });
   try {
     await options.onConfirm();
     toast.style = Toast.Style.Success;
     toast.title = "完成！";
+    return true;
   } catch (error) {
     toast.style = Toast.Style.Failure;
     toast.title = "執行失敗";
     toast.message = error instanceof Error ? error.message : String(error);
+    return false;
   }
 }
 

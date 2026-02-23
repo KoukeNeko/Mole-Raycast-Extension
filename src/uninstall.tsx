@@ -1,20 +1,165 @@
-import { ActionPanel, Action, Icon, List, showToast, Toast, Color } from "@raycast/api";
+import { ActionPanel, Action, Icon, List, showToast, Toast, Detail, useNavigation } from "@raycast/api";
 import { useEffect, useState, useMemo } from "react";
-import { exec } from "child_process";
-import { promisify } from "util";
-import fs from "fs";
 import path from "path";
-import { execMo, formatBytesShort, confirmAndExecute, trashPaths } from "./utils";
+import { execMo, confirmAndExecute, trashPaths, stripAnsi, formatBytesShort } from "./utils";
 
-const execAsync = promisify(exec);
+export interface LeftoverFile {
+  path: string;
+  sizeDisplay: string;
+}
 
 interface InstalledApp {
   name: string;
   path: string;
   bundleId?: string;
   sizeBytes?: number;
-  isLoadingSize?: boolean;
-  mtimeMs?: number;
+  lastUsedDisplay?: string;
+  leftoversDisplay?: string;
+  leftoverFiles: LeftoverFile[];
+  mtimeMs?: number; // Used for "time" sorting if needed, but we'll adapt to parsed data
+}
+
+function parseSizeString(sizeStr: string): number {
+  if (!sizeStr || sizeStr === "N/A") return 0;
+  const match = sizeStr.match(/^([\d.]+)\s*(B|KB|MB|GB|TB)$/i);
+  if (!match) return 0;
+
+  const val = parseFloat(match[1]);
+  const unit = match[2].toUpperCase();
+  const k = 1024;
+  switch (unit) {
+    case "B": return val;
+    case "KB": return val * k;
+    case "MB": return val * k * k;
+    case "GB": return val * k * k * k;
+    case "TB": return val * k * k * k * k;
+    default: return val;
+  }
+}
+
+function parseDryRunDetailsOutput(output: string): InstalledApp[] {
+  const lines = output.split(/[\r\n]+/);
+  const found: InstalledApp[] = [];
+  let currentApp: InstalledApp | null = null;
+
+  for (let line of lines) {
+    const cleanLine = stripAnsi(line).trimEnd(); // remove ansi, keep indent for checking if needed
+
+    if (cleanLine.trim().startsWith("→")) {
+      const parts = cleanLine.split("|").map(p => p.trim());
+      if (parts.length < 4) continue;
+
+      const nameSizeStr = parts[0];
+      const nameSizeMatch = nameSizeStr.match(/^→\s*(.+?)\s+([\d.]+(?:B|KB|MB|GB|TB|N\/A))$/i);
+      if (!nameSizeMatch) continue;
+
+      const [, name, sizeStr] = nameSizeMatch;
+      const bundleId = parts[1];
+      const fullPath = parts[2];
+
+      const lastUsedStr = parts.find(p => p.startsWith("Last:"))?.replace(/^Last:\s*/i, "");
+      const leftoversStr = parts.find(p => p.startsWith("Leftovers:"))?.replace(/^Leftovers:\s*/i, "");
+
+      currentApp = {
+        name: name.trim(),
+        path: fullPath.trim(),
+        bundleId: bundleId && bundleId !== "N/A" ? bundleId : undefined,
+        sizeBytes: parseSizeString(sizeStr),
+        lastUsedDisplay: lastUsedStr,
+        leftoversDisplay: leftoversStr,
+        leftoverFiles: []
+      };
+      found.push(currentApp);
+      continue;
+    }
+
+    if (currentApp && cleanLine.match(/^\s*[├└]─/)) {
+      const leftoverMatch = cleanLine.match(/^\s*[├└]─\s*(.+?)\s+([\d.]+(?:B|KB|MB|GB|TB|N\/A))$/i);
+      if (leftoverMatch) {
+        currentApp.leftoverFiles.push({
+          path: leftoverMatch[1].trim(),
+          sizeDisplay: leftoverMatch[2].trim()
+        });
+      }
+    }
+  }
+
+  return found;
+}
+
+function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () => Promise<void> }) {
+  const { pop } = useNavigation();
+
+  const resolvePath = (p: string) => p.replace(/^~(?=$|\/|\\)/, process.env.HOME || "");
+
+  const appActions = (
+    <ActionPanel>
+      <Action
+        title="Uninstall App"
+        icon={Icon.Trash}
+        style={Action.Style.Destructive}
+        onAction={async () => {
+          await onUninstall();
+          pop();
+        }}
+      />
+      <Action.ShowInFinder title="Show in Finder" path={app.path} />
+    </ActionPanel>
+  );
+
+  return (
+    <List navigationTitle={app.name}>
+      <List.Section title="App Information">
+        <List.Item
+          title="App Path"
+          subtitle={app.path}
+          icon={Icon.Finder}
+          actions={appActions}
+        />
+        <List.Item
+          title="Bundle ID"
+          subtitle={app.bundleId || "N/A"}
+          icon={Icon.Box}
+          actions={appActions}
+        />
+        <List.Item
+          title="Size"
+          subtitle={formatBytesShort(app.sizeBytes || 0)}
+          icon={Icon.HardDrive}
+          actions={appActions}
+        />
+        {app.lastUsedDisplay && app.lastUsedDisplay !== "N/A" && (
+          <List.Item
+            title="Last Used"
+            subtitle={app.lastUsedDisplay}
+            icon={Icon.Calendar}
+            actions={appActions}
+          />
+        )}
+      </List.Section>
+
+      {app.leftoverFiles && app.leftoverFiles.length > 0 && (
+        <List.Section title={`Leftovers (${app.leftoversDisplay})`}>
+          {app.leftoverFiles.map((f, index) => {
+            const absPath = resolvePath(f.path);
+            return (
+              <List.Item
+                key={index}
+                title={f.path}
+                icon={Icon.Document}
+                accessories={[{ text: f.sizeDisplay }]}
+                actions={
+                  <ActionPanel>
+                    <Action.ShowInFinder title="Show in Finder" path={absPath} />
+                  </ActionPanel>
+                }
+              />
+            );
+          })}
+        </List.Section>
+      )}
+    </List>
+  );
 }
 
 export default function UninstallCommand() {
@@ -25,9 +170,9 @@ export default function UninstallCommand() {
   async function fetchApps() {
     setIsLoading(true);
     try {
-      const foundApps = await scanApps();
+      const output = await execMo(["uninstall", "--dry-run", "--details"]);
+      const foundApps = parseDryRunDetailsOutput(output);
       setApps(foundApps);
-      calculateSizes(foundApps);
     } catch (err) {
       showToast({ style: Toast.Style.Failure, title: "Failed to scan apps", message: String(err) });
     } finally {
@@ -39,25 +184,8 @@ export default function UninstallCommand() {
     fetchApps();
   }, []);
 
-  async function calculateSizes(initialApps: InstalledApp[]) {
-    for (const app of initialApps) {
-      execAsync(`du -sk "${app.path}"`)
-        .then(({ stdout }) => {
-          const sizeKb = parseInt(stdout.split("\t")[0], 10);
-          if (!isNaN(sizeKb)) {
-            setApps((prev) =>
-              prev.map((p) => (p.path === app.path ? { ...p, sizeBytes: sizeKb * 1024, isLoadingSize: false } : p)),
-            );
-          }
-        })
-        .catch(() => {
-          setApps((prev) => prev.map((p) => (p.path === app.path ? { ...p, isLoadingSize: false } : p)));
-        });
-    }
-  }
-
   async function uninstallApp(app: InstalledApp) {
-    await confirmAndExecute({
+    const isConfirmed = await confirmAndExecute({
       title: `移除 ${app.name}？`,
       message: `這將會把應用程式本體${app.bundleId ? "與其相關的快取與設定檔" : ""}移至垃圾桶。`,
       primaryAction: `移除 ${app.name}`,
@@ -66,8 +194,17 @@ export default function UninstallCommand() {
         try {
           const pathsToTrash = [app.path];
 
-          if (app.bundleId) {
-            const home = process.env.HOME || "";
+          // Use parsed leftover files directly if requested
+          // Since Mole output uses ~/, we'll resolve it before trashing
+          const home = process.env.HOME || "";
+          if (app.leftoverFiles && app.leftoverFiles.length > 0) {
+            for (const leftover of app.leftoverFiles) {
+              const absPath = leftover.path.replace(/^~(?=$|\/|\\)/, home);
+              pathsToTrash.push(absPath);
+            }
+          } else if (app.bundleId) {
+            // Fallback if no specific leftovers were parsed
+            const fs = require("fs");
             const leftovers = [
               path.join(home, "Library/Application Support", app.bundleId),
               path.join(home, "Library/Caches", app.bundleId),
@@ -85,7 +222,6 @@ export default function UninstallCommand() {
           await trashPaths(pathsToTrash);
           await showToast({ style: Toast.Style.Success, title: `${app.name} uninstalled` });
 
-          // Refresh the list from the filesystem instead of just filtering state
           await fetchApps();
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -93,6 +229,7 @@ export default function UninstallCommand() {
         }
       },
     });
+    return isConfirmed !== false;
   }
 
   const sortedApps = useMemo(() => {
@@ -100,7 +237,7 @@ export default function UninstallCommand() {
       if (sorting === "size") {
         return (b.sizeBytes || 0) - (a.sizeBytes || 0);
       } else if (sorting === "time") {
-        return (b.mtimeMs || 0) - (a.mtimeMs || 0);
+        return a.name.localeCompare(b.name);
       } else {
         return a.name.localeCompare(b.name);
       }
@@ -130,15 +267,20 @@ export default function UninstallCommand() {
             icon={{ fileIcon: app.path }}
             title={app.name}
             subtitle={app.bundleId}
-            accessories={
-              app.sizeBytes
-                ? [{ text: formatBytesShort(app.sizeBytes) }]
-                : app.isLoadingSize !== false
-                  ? [{ text: "Calculating..." }]
-                  : []
-            }
+            accessories={[
+              // Time was removed to reduce noise as requested
+              // Show leftovers if available
+              ...(app.leftoversDisplay ? [{ text: `Leftovers: ${app.leftoversDisplay}`, icon: Icon.Important }] : []),
+              // Show size
+              ...(app.sizeBytes ? [{ text: formatBytesShort(app.sizeBytes) }] : [])
+            ]}
             actions={
               <ActionPanel>
+                <Action.Push
+                  title="Show Details"
+                  icon={Icon.Sidebar}
+                  target={<AppDetail app={app} onUninstall={async () => { await uninstallApp(app); }} />}
+                />
                 <Action
                   title="Uninstall App"
                   icon={Icon.Trash}
@@ -153,112 +295,4 @@ export default function UninstallCommand() {
       </List.Section>
     </List>
   );
-}
-
-// --- Scanner Helpers ---
-async function scanApps(): Promise<InstalledApp[]> {
-  const apps: InstalledApp[] = [];
-  const searchDirs = ["/Applications", "/System/Applications", path.join(process.env.HOME || "", "Applications")];
-
-  // Exclude system protected apps
-  const protectedApps = [
-    "Safari.app",
-    "Mail.app",
-    "Messages.app",
-    "FaceTime.app",
-    "Maps.app",
-    "Photos.app",
-    "Calendar.app",
-    "Contacts.app",
-    "Reminders.app",
-    "Notes.app",
-    "Music.app",
-    "Podcasts.app",
-    "TV.app",
-    "Books.app",
-    "News.app",
-    "Stocks.app",
-    "Weather.app",
-    "VoiceMemos.app",
-    "Calculator.app",
-    "Dictionary.app",
-    "Chess.app",
-    "Stickies.app",
-    "Font Book.app",
-    "Image Capture.app",
-    "Preview.app",
-    "QuickTime Player.app",
-    "TextEdit.app",
-    "Time Machine.app",
-    "Automator.app",
-    "Mission Control.app",
-    "System Preferences.app",
-    "System Settings.app",
-    "App Store.app",
-    "Launchpad.app",
-    "Dashboard.app",
-    "Siri.app",
-    "FindMy.app",
-    "Shortcuts.app",
-    "Home.app",
-    "Freeform.app",
-  ];
-
-  for (const dir of searchDirs) {
-    if (!fs.existsSync(dir)) continue;
-
-    try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.endsWith(".app")) {
-          // Skip core apps
-          if (protectedApps.includes(entry.name)) continue;
-
-          const appPath = path.join(dir, entry.name);
-          const infoPlistPath = path.join(appPath, "Contents", "Info.plist");
-          let bundleId = undefined;
-
-          if (fs.existsSync(infoPlistPath)) {
-            try {
-              const { stdout } = await execAsync(`defaults read "${infoPlistPath}" CFBundleIdentifier`);
-              bundleId = stdout.trim();
-            } catch {
-              // Ignore Plist errors
-            }
-          }
-
-          apps.push({
-            name: entry.name.replace(".app", ""),
-            path: appPath,
-            bundleId,
-            isLoadingSize: true,
-            mtimeMs: fs.statSync(appPath).mtimeMs,
-          });
-        }
-      }
-    } catch (e) {
-      console.error(`Failed to scan ${dir}:`, e);
-    }
-  }
-
-  // Setapp
-  const setappDir = path.join(process.env.HOME || "", "Library/Application Support/Setapp/Applications");
-  if (fs.existsSync(setappDir)) {
-    try {
-      const entries = fs.readdirSync(setappDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory() && entry.name.endsWith(".app")) {
-          const appPath = path.join(setappDir, entry.name);
-          apps.push({
-            name: entry.name.replace(".app", ""),
-            path: appPath,
-            isLoadingSize: true,
-            mtimeMs: fs.statSync(appPath).mtimeMs,
-          });
-        }
-      }
-    } catch { }
-  }
-
-  return apps;
 }
