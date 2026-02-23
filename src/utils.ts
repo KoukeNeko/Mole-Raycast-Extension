@@ -9,6 +9,14 @@ const execFileAsync = promisify(execFile);
 
 // --- Constants ---
 
+/** Resolve the bundled Mole CLI from the submodule (relative to this extension's source root). */
+function getBundledMoPath(): string {
+  // At runtime, __dirname points to the compiled output directory.
+  // The submodule lives at <extension-root>/Mole/mo
+  const extensionRoot = path.resolve(__dirname, "..");
+  return path.join(extensionRoot, "Mole", "mo");
+}
+
 const MO_SEARCH_PATHS = [
   "/usr/local/bin/mo",
   "/opt/homebrew/bin/mo",
@@ -26,6 +34,14 @@ let cachedMoPath: string | null = null;
 export async function getMoPath(): Promise<string> {
   if (cachedMoPath) return cachedMoPath;
 
+  // 1. Prefer bundled submodule version
+  const bundled = getBundledMoPath();
+  if (existsSync(bundled)) {
+    cachedMoPath = bundled;
+    return bundled;
+  }
+
+  // 2. Try system-wide `which`
   try {
     const { stdout } = await execFileAsync("which", ["mo"]);
     const resolved = stdout.trim();
@@ -37,6 +53,7 @@ export async function getMoPath(): Promise<string> {
     // which failed, try fallback paths
   }
 
+  // 3. Fallback to well-known system paths
   for (const candidate of MO_SEARCH_PATHS) {
     if (existsSync(candidate)) {
       cachedMoPath = candidate;
