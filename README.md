@@ -2,6 +2,8 @@
 
 Deep clean and optimize your Mac directly from Raycast. This extension serves as a graphical and blazing fast interface to the [Mole](https://github.com/KoukeNeko/Mole) CLI utility.
 
+<img width="862" height="586" alt="image" src="https://github.com/user-attachments/assets/e31a61e4-e742-4b74-9149-9fb384c797b8" />
+
 ## Commands
 
 | Command | Description |
