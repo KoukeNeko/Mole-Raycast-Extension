@@ -1,6 +1,7 @@
 import { ActionPanel, Action, Icon, List, showToast, Toast, Detail, useNavigation } from "@raycast/api";
 import { useEffect, useState, useMemo } from "react";
 import path from "path";
+import fs from "fs";
 import { execMo, confirmAndExecute, trashPaths, stripAnsi, formatBytesShort } from "./utils";
 
 export interface LeftoverFile {
@@ -87,8 +88,52 @@ function parseDryRunDetailsOutput(output: string): InstalledApp[] {
   return found;
 }
 
-function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () => Promise<void> }) {
+function useAnimatedEllipsis() {
+  const [frame, setFrame] = useState(0);
+  const frames = ["...", "..", ".", ".."];
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setFrame((prev) => (prev + 1) % frames.length);
+    }, 400); // 400ms interval for a relaxed text animation
+    return () => clearInterval(timer);
+  }, []);
+
+  return frames[frame];
+}
+
+// Find leftovers for a specific app dynamically using the Mole CLI
+async function scanLeftoversForApp(app: InstalledApp): Promise<{ files: LeftoverFile[]; display?: string }> {
+  try {
+    const output = await execMo(["uninstall", "--dry-run", "--details", "--app-path", app.path]);
+    const detailedApps = parseDryRunDetailsOutput(output);
+    const match = detailedApps.find(a => a.path === app.path);
+    return {
+      files: match?.leftoverFiles || [],
+      display: match?.leftoversDisplay
+    };
+  } catch (e) {
+    return { files: [] };
+  }
+}
+
+function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: (leftovers?: LeftoverFile[]) => Promise<void> }) {
   const { pop } = useNavigation();
+  const [leftovers, setLeftovers] = useState<LeftoverFile[]>(app.leftoverFiles || []);
+  const [leftoversDisplay, setLeftoversDisplay] = useState<string | undefined>(app.leftoversDisplay);
+  const [isScanning, setIsScanning] = useState(false);
+
+  useEffect(() => {
+    // Dynamically scan leftovers when opening details
+    if (leftovers.length === 0 && !app.leftoversDisplay) {
+      setIsScanning(true);
+      scanLeftoversForApp(app).then((result) => {
+        setLeftovers(result.files);
+        setLeftoversDisplay(result.display);
+        setIsScanning(false);
+      });
+    }
+  }, [app]);
 
   const resolvePath = (p: string) => p.replace(/^~(?=$|\/|\\)/, process.env.HOME || "");
 
@@ -99,7 +144,7 @@ function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () =>
         icon={Icon.Trash}
         style={Action.Style.Destructive}
         onAction={async () => {
-          await onUninstall();
+          await onUninstall(leftovers);
           pop();
         }}
       />
@@ -108,8 +153,14 @@ function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () =>
   );
 
   return (
-    <List navigationTitle={app.name}>
+    <List navigationTitle={app.name} isLoading={isScanning}>
       <List.Section title="App Information">
+        <List.Item
+          title="App Name"
+          subtitle={app.name}
+          icon={{ fileIcon: app.path }}
+          actions={appActions}
+        />
         <List.Item
           title="App Path"
           subtitle={app.path}
@@ -138,9 +189,9 @@ function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () =>
         )}
       </List.Section>
 
-      {app.leftoverFiles && app.leftoverFiles.length > 0 && (
-        <List.Section title={`Leftovers (${app.leftoversDisplay})`}>
-          {app.leftoverFiles.map((f, index) => {
+      {leftovers.length > 0 && (
+        <List.Section title={`Leftovers ${leftoversDisplay ? `(${leftoversDisplay})` : `(${leftovers.length} files)`}`}>
+          {leftovers.map((f, index) => {
             const absPath = resolvePath(f.path);
             return (
               <List.Item
@@ -151,6 +202,15 @@ function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () =>
                 actions={
                   <ActionPanel>
                     <Action.ShowInFinder title="Show in Finder" path={absPath} />
+                    <Action
+                      title="Uninstall App & Leftovers"
+                      icon={Icon.Trash}
+                      style={Action.Style.Destructive}
+                      onAction={async () => {
+                        await onUninstall(leftovers);
+                        pop();
+                      }}
+                    />
                   </ActionPanel>
                 }
               />
@@ -158,7 +218,68 @@ function AppDetail({ app, onUninstall }: { app: InstalledApp; onUninstall: () =>
           })}
         </List.Section>
       )}
+
+      {(!isScanning && leftovers.length === 0) && (
+        <List.Section title="Leftovers">
+          <List.Item title="No leftovers found." icon={Icon.CheckCircle} actions={appActions} />
+        </List.Section>
+      )}
     </List>
+  );
+}
+
+// New component to encapsulate the animated icon logic and UI for each individual list item
+function AppListItem({
+  app,
+  isScanning,
+  leftoversDisplay,
+  leftoverFiles,
+  onUninstall
+}: {
+  app: InstalledApp;
+  isScanning: boolean;
+  leftoversDisplay?: string;
+  leftoverFiles?: LeftoverFile[];
+  onUninstall: (app: InstalledApp, leftovers?: LeftoverFile[]) => Promise<boolean>;
+}) {
+  const ellipsis = useAnimatedEllipsis();
+
+  return (
+    <List.Item
+      icon={{ fileIcon: app.path }}
+      title={app.name}
+      subtitle={app.bundleId}
+      accessories={[
+        ...(isScanning ? [{ text: `${ellipsis}` }] : []),
+        ...(leftoversDisplay ? [{ text: `Leftovers: ${leftoversDisplay}`, icon: Icon.Important }] : []),
+        ...(app.sizeBytes ? [{ text: formatBytesShort(app.sizeBytes) }] : [])
+      ]}
+      actions={
+        <ActionPanel>
+          <Action.Push
+            title="Show Details"
+            icon={Icon.Sidebar}
+            target={
+              <AppDetail
+                app={{
+                  ...app,
+                  leftoversDisplay: leftoversDisplay || app.leftoversDisplay,
+                  leftoverFiles: leftoverFiles || app.leftoverFiles || []
+                }}
+                onUninstall={async (leftovers) => { await onUninstall(app, leftovers); }}
+              />
+            }
+          />
+          <Action
+            title="Uninstall App"
+            icon={Icon.Trash}
+            style={Action.Style.Destructive}
+            onAction={() => onUninstall(app)}
+          />
+          <Action.ShowInFinder title="Show in Finder" path={app.path} />
+        </ActionPanel>
+      }
+    />
   );
 }
 
@@ -167,12 +288,71 @@ export default function UninstallCommand() {
   const [isLoading, setIsLoading] = useState(true);
   const [sorting, setSorting] = useState<"name" | "size" | "time">("name");
 
+  // Separate states for lazy-loaded data to prevent full list re-renders
+  const [scanningApps, setScanningApps] = useState<Set<string>>(new Set());
+  const [leftoversMap, setLeftoversMap] = useState<Record<string, LeftoverFile[]>>({});
+  const [displayMap, setDisplayMap] = useState<Record<string, string>>({});
+
   async function fetchApps() {
     setIsLoading(true);
     try {
-      const output = await execMo(["uninstall", "--dry-run", "--details"]);
+      // Fast initial scan
+      const output = await execMo(["uninstall", "--dry-run"]);
       const foundApps = parseDryRunDetailsOutput(output);
       setApps(foundApps);
+
+      // Populate initial maps from the fast scan (which may have empty leftovers if --details was removed)
+      const initialLeftovers: Record<string, LeftoverFile[]> = {};
+      const initialDisplay: Record<string, string> = {};
+
+      for (const app of foundApps) {
+        if (app.leftoverFiles && app.leftoverFiles.length > 0) {
+          initialLeftovers[app.path] = app.leftoverFiles;
+        }
+        if (app.leftoversDisplay) {
+          initialDisplay[app.path] = app.leftoversDisplay;
+        }
+      }
+      setLeftoversMap(initialLeftovers);
+      setDisplayMap(initialDisplay);
+
+      // Start background lazy loading for each app
+      const toScan = foundApps.filter(a => !initialDisplay[a.path]);
+
+      setScanningApps(new Set(toScan.map(a => a.path)));
+
+      // We intentionally do not await this, it runs in the background
+      // Use a simple concurrency limit (e.g. 3) to prevent UI hanging
+      const CONCURRENCY_LIMIT = 5;
+      let i = 0;
+
+      const workers = Array.from({ length: CONCURRENCY_LIMIT }).map(async () => {
+        while (i < toScan.length) {
+          const currentIndex = i++;
+          const appToScan = toScan[currentIndex];
+
+          try {
+            const result = await scanLeftoversForApp(appToScan);
+
+            // Update specific map entries without mapping over the entire apps array
+            setLeftoversMap(prev => ({ ...prev, [appToScan.path]: result.files }));
+            if (result.display) {
+              const displayString = result.display;
+              setDisplayMap(prev => ({ ...prev, [appToScan.path]: displayString }));
+            }
+
+          } finally {
+            // Remove from scanning set
+            setScanningApps(current => {
+              const next = new Set(current);
+              next.delete(appToScan.path);
+              return next;
+            });
+          }
+        }
+      });
+      Promise.all(workers);
+
     } catch (err) {
       showToast({ style: Toast.Style.Failure, title: "Failed to scan apps", message: String(err) });
     } finally {
@@ -184,7 +364,7 @@ export default function UninstallCommand() {
     fetchApps();
   }, []);
 
-  async function uninstallApp(app: InstalledApp) {
+  async function uninstallApp(app: InstalledApp, customLeftovers?: LeftoverFile[]) {
     const isConfirmed = await confirmAndExecute({
       title: `移除 ${app.name}？`,
       message: `這將會把應用程式本體${app.bundleId ? "與其相關的快取與設定檔" : ""}移至垃圾桶。`,
@@ -195,10 +375,13 @@ export default function UninstallCommand() {
           const pathsToTrash = [app.path];
 
           // Use parsed leftover files directly if requested
-          // Since Mole output uses ~/, we'll resolve it before trashing
+          // Since it uses ~/, we'll resolve it before trashing
           const home = process.env.HOME || "";
-          if (app.leftoverFiles && app.leftoverFiles.length > 0) {
-            for (const leftover of app.leftoverFiles) {
+
+          const leftoverSource = customLeftovers || leftoversMap[app.path] || app.leftoverFiles || [];
+
+          if (leftoverSource && leftoverSource.length > 0) {
+            for (const leftover of leftoverSource) {
               const absPath = leftover.path.replace(/^~(?=$|\/|\\)/, home);
               pathsToTrash.push(absPath);
             }
@@ -262,34 +445,13 @@ export default function UninstallCommand() {
     >
       <List.Section title={`Installed Applications (${sortedApps.length})`}>
         {sortedApps.map((app) => (
-          <List.Item
+          <AppListItem
             key={app.path}
-            icon={{ fileIcon: app.path }}
-            title={app.name}
-            subtitle={app.bundleId}
-            accessories={[
-              // Time was removed to reduce noise as requested
-              // Show leftovers if available
-              ...(app.leftoversDisplay ? [{ text: `Leftovers: ${app.leftoversDisplay}`, icon: Icon.Important }] : []),
-              // Show size
-              ...(app.sizeBytes ? [{ text: formatBytesShort(app.sizeBytes) }] : [])
-            ]}
-            actions={
-              <ActionPanel>
-                <Action.Push
-                  title="Show Details"
-                  icon={Icon.Sidebar}
-                  target={<AppDetail app={app} onUninstall={async () => { await uninstallApp(app); }} />}
-                />
-                <Action
-                  title="Uninstall App"
-                  icon={Icon.Trash}
-                  style={Action.Style.Destructive}
-                  onAction={() => uninstallApp(app)}
-                />
-                <Action.ShowInFinder title="Show in Finder" path={app.path} />
-              </ActionPanel>
-            }
+            app={app}
+            isScanning={scanningApps.has(app.path)}
+            leftoversDisplay={displayMap[app.path] || app.leftoversDisplay}
+            leftoverFiles={leftoversMap[app.path] || app.leftoverFiles}
+            onUninstall={uninstallApp}
           />
         ))}
       </List.Section>
