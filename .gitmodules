@@ -1,0 +1,3 @@
+[submodule "Mole"]
+	path = Mole
+	url = https://github.com/KoukeNeko/Mole.git
